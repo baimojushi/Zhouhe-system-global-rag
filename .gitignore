@@ -33,6 +33,9 @@ __pycache__
 # Environment (store API key separately, don't commit real secrets)
 stack/.env
 
+# Sky-updater runtime data (live night sky images)
+data/sky/
+
 # OS
 .DS_Store
 Thumbs.db

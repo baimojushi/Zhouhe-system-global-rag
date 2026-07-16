@@ -1,0 +1,25 @@
+# Sky updater sidecar — ESO ALPACA real-time night sky background
+# Usage: docker compose -f docker-compose.sky.yml up -d --build
+
+services:
+  sky-updater:
+    build:
+      context: .
+      dockerfile: Dockerfile.sky
+    environment:
+      SKY_UPDATE_SECONDS: ${SKY_UPDATE_SECONDS:-3600}
+      SKY_MIN_SQM_ZEN: ${SKY_MIN_SQM_ZEN:-21.8}
+      SKY_DISPLAY_SIZE: ${SKY_DISPLAY_SIZE:-3840}
+      SKY_WEBP_QUALITY: ${SKY_WEBP_QUALITY:-88}
+      SKY_OUTPUT_DIR: /data/sky
+    volumes:
+      - sky-data:/data/sky
+    restart: unless-stopped
+
+  # Proxy: Next.js already serves /api/sky/*, but this sidecar can be used
+  # if you want the sky-updater to run as a separate process and share /data/sky.
+  # The API routes in frontend/app/api/sky/* read from data/sky/ and fall back
+  # to public/sky/ when live data is not available.
+
+volumes:
+  sky-data:

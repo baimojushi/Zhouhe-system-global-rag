@@ -1,0 +1,18 @@
+FROM python:3.12-slim-bookworm
+
+WORKDIR /worker
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ncompress \
+    && rm -rf /var/lib/apt/lists/*
+COPY sky-worker/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+COPY sky-worker/update_sky.py ./update_sky.py
+
+ENV PYTHONUNBUFFERED=1
+ENV SKY_OUTPUT_DIR=/data/sky
+ENV SKY_UPDATE_SECONDS=3600
+ENV SKY_MIN_SQM_ZEN=21.8
+ENV SKY_DISPLAY_SIZE=3840
+
+VOLUME ["/data/sky"]
+CMD ["python", "update_sky.py"]

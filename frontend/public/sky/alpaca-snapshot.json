@@ -1,0 +1,19 @@
+{
+  "provider": "ESO",
+  "instrument": "ALPACA",
+  "site": "Paranal Observatory, Chile",
+  "dpId": "ALPACA.2026-07-16T06:56:52.000",
+  "capturedAt": "2026-07-16T06:56:52.000Z",
+  "exposureEnd": "2026-07-16T06:58:52.000Z",
+  "exposureSeconds": 120,
+  "sqmZen": 22.0,
+  "sourceWidth": 8750,
+  "sourceHeight": 8750,
+  "displayWidth": 3840,
+  "displayHeight": 3840,
+  "status": "bundled-fallback",
+  "isFallback": true,
+  "sourcePage": "https://archive.eso.org/cms/eso-archive-news/alpaca-all-sky-images-from-paranal-available-in-the-archive.html",
+  "archiveRecord": "https://archive.eso.org/datalink/links?ID=ivo://eso.org/ID?ALPACA.2026-07-16T06:56:52.000",
+  "credit": "ESO / ALPACA"
+}
