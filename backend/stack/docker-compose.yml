@@ -1,0 +1,43 @@
+services:
+  weaviate:
+    image: m.daocloud.io/docker.io/semitechnologies/weaviate:1.38.3
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:50051:50051"
+      - "127.0.0.1:2112:2112"
+    volumes:
+      - /opt/global-rag/weaviate:/var/lib/weaviate
+      - /opt/global-rag/backups:/backups
+    environment:
+      QUERY_DEFAULTS_LIMIT: "50"
+      PERSISTENCE_DATA_PATH: /var/lib/weaviate
+      CLUSTER_HOSTNAME: rag-node-1
+
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "false"
+      AUTHENTICATION_APIKEY_ENABLED: "true"
+      AUTHENTICATION_APIKEY_ALLOWED_KEYS: ${WEAVIATE_API_KEY}
+      AUTHENTICATION_APIKEY_USERS: ${WEAVIATE_USER}
+      AUTHORIZATION_ENABLE_RBAC: "true"
+      AUTHORIZATION_RBAC_ROOT_USERS: ${WEAVIATE_USER}
+
+      ENABLE_MODULES: backup-filesystem
+      DEFAULT_VECTORIZER_MODULE: none
+      BACKUP_FILESYSTEM_PATH: /backups
+
+      ENABLE_TOKENIZER_GSE: "true"
+      TOKENIZER_CONCURRENCY_COUNT: "4"
+
+      MCP_SERVER_ENABLED: "true"
+      MCP_SERVER_WRITE_ACCESS_ENABLED: "false"
+
+      PROMETHEUS_MONITORING_ENABLED: "true"
+      PROMETHEUS_MONITORING_PORT: "2112"
+
+      ASYNC_INDEXING: "true"
+      GOMEMLIMIT: 11264MiB
+      GOMAXPROCS: "8"
+
+      DISABLE_TELEMETRY: "true"
+      LOG_LEVEL: info
+    mem_limit: 14g

@@ -1,0 +1,26 @@
+[
+  {
+    "path": "/opt/global-rag/kb/docker-guide.md",
+    "hash": "ba608b27ae7f41cd4093da8b2bf0390b6da5eb62b1a65286220fbff34bb169cd",
+    "chunk_count": 13,
+    "indexed_at": "2026-07-16T05:19:35Z"
+  },
+  {
+    "path": "/opt/global-rag/kb/rag-api-example.py",
+    "hash": "f2fd6f3445cbd2c17b489b747f982efb0bdab318386bd2382238213021f330c2",
+    "chunk_count": 8,
+    "indexed_at": "2026-07-16T05:19:35Z"
+  },
+  {
+    "path": "/opt/global-rag/kb/rag-architecture.md",
+    "hash": "d6689305bd3fc2d800045b5eb84fa004febd825c9a11eeab9a0c305fcec6ec84",
+    "chunk_count": 10,
+    "indexed_at": "2026-07-16T05:19:36Z"
+  },
+  {
+    "path": "/opt/global-rag/kb/wsl2-guide.md",
+    "hash": "91b4d1d7ded573d14203b7dde131e4177c423e21a100f5123b1525e317548294",
+    "chunk_count": 12,
+    "indexed_at": "2026-07-16T05:19:37Z"
+  }
+]
