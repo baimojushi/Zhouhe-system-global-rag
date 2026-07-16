@@ -1,6 +1,7 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { KnowledgeWorkbench } from "./knowledge-workbench";
 
 type View = "search" | "library" | "memory" | "status" | "settings";
 type HealthState = "online" | "offline" | "checking";
@@ -21,6 +22,13 @@ type SearchResult = {
 
 type Settings = {
   demoMode: boolean;
+  theme: "light" | "night";
+  stellarDensity: number;
+  limitingMagnitude: number;
+  twinkleStrength: number;
+  glassOpacity: number;
+  galaxyExposure: number;
+  syntheticOverlay: boolean;
   gatewayUrl: string;
   weaviateUrl: string;
   embeddingUrl: string;
@@ -30,13 +38,54 @@ type Settings = {
 };
 
 const defaultSettings: Settings = {
-  demoMode: false,
-  gatewayUrl: "http://127.0.0.1:9100",
+  demoMode: true,
+  theme: "light",
+  stellarDensity: 1,
+  limitingMagnitude: 7.2,
+  twinkleStrength: 28,
+  glassOpacity: 24,
+  galaxyExposure: 82,
+  syntheticOverlay: false,
+  gatewayUrl: "http://127.0.0.1:8090",
   weaviateUrl: "http://127.0.0.1:8080",
-  embeddingUrl: "",
+  embeddingUrl: "http://127.0.0.1:11434",
   vllmUrl: "http://127.0.0.1:8000",
-  apiKey: "1c95b235989f7ef61fdb2c73513ab8e1d9bb750094c30d11f4d506de3acacf1e",
-  model: "gemma-4-31b-jang-crack",
+  apiKey: "",
+  model: "qwen2.5-32b-instruct",
+};
+
+type SkyFrame = {
+  provider: string;
+  instrument: string;
+  site: string;
+  dpId: string;
+  capturedAt: string;
+  exposureSeconds: number;
+  sqmZen: number;
+  sourceWidth: number;
+  sourceHeight: number;
+  status: "latest-qualified" | "bundled-fallback";
+  isFallback: boolean;
+  imageUrl: string;
+  credit: string;
+  sourcePage: string;
+};
+
+const fallbackSkyFrame: SkyFrame = {
+  provider: "ESO",
+  instrument: "ALPACA",
+  site: "Paranal Observatory, Chile",
+  dpId: "ALPACA.2026-07-16T06:56:52.000",
+  capturedAt: "2026-07-16T06:56:52.000Z",
+  exposureSeconds: 120,
+  sqmZen: 22,
+  sourceWidth: 8750,
+  sourceHeight: 8750,
+  status: "bundled-fallback",
+  isFallback: true,
+  imageUrl: "/sky/alpaca-snapshot.webp",
+  credit: "ESO / ALPACA",
+  sourcePage: "https://archive.eso.org/cms/eso-archive-news/alpaca-all-sky-images-from-paranal-available-in-the-archive.html",
 };
 
 const demoResults: SearchResult[] = [
@@ -80,13 +129,13 @@ const demoResults: SearchResult[] = [
 
 const navItems: { id: View; label: string; sub: string; icon: IconName }[] = [
   { id: "search", label: "检索", sub: "混合召回", icon: "search" },
-  { id: "library", label: "知识库", sub: "索引与来源", icon: "book" },
+  { id: "library", label: "知识库", sub: "分类与关联", icon: "book" },
   { id: "memory", label: "上下文", sub: "会话记忆", icon: "message" },
   { id: "status", label: "服务状态", sub: "运行与延迟", icon: "pulse" },
   { id: "settings", label: "设置", sub: "端点与模型", icon: "settings" },
 ];
 
-type IconName = "search" | "book" | "message" | "pulse" | "settings" | "quote" | "path" | "plus" | "trash" | "check" | "arrow" | "spark" | "copy";
+type IconName = "search" | "book" | "message" | "pulse" | "settings" | "quote" | "path" | "plus" | "trash" | "check" | "arrow" | "spark" | "copy" | "sun" | "moon";
 
 function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
   const paths: Record<IconName, React.ReactNode> = {
@@ -103,8 +152,108 @@ function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
     arrow: <><path d="M5 12h14M13 6l6 6-6 6"/></>,
     spark: <><path d="m12 3 1.2 4.1L17 9l-3.8 1.9L12 15l-1.2-4.1L7 9l3.8-1.9z"/><path d="m18.5 14 .7 2.3 2.3.7-2.3.7-.7 2.3-.7-2.3-2.3-.7 2.3-.7z"/></>,
     copy: <><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></>,
+    sun: <><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/></>,
+    moon: <path d="M20.4 15.5A8.3 8.3 0 0 1 8.5 3.6a8.4 8.4 0 1 0 11.9 11.9Z"/>,
   };
   return <svg aria-hidden="true" viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
+}
+
+function DeepSpaceBackdrop({ active, overlay, imageUrl, density, limitingMagnitude, twinkle }: { active: boolean; overlay: boolean; imageUrl: string; density: number; limitingMagnitude: number; twinkle: number }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    if (!active || !overlay) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    const surface = canvas;
+    const drawing = context;
+
+    type Star = { x: number; y: number; magnitude: number; radius: number; alpha: number; phase: number; speed: number; amplitude: number; color: string };
+    let width = 0;
+    let height = 0;
+    let pixelRatio = 1;
+    let stars: Star[] = [];
+    let animationFrame = 0;
+    let lastPaint = 0;
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const minMagnitude = -1.46;
+
+    function rebuildStars() {
+      const magnitudeFactor = Math.min(2.4, Math.pow(10, 0.15 * (limitingMagnitude - 6.5)));
+      const count = Math.min(1200, Math.max(80, Math.round((width * height / 10500) * density * magnitudeFactor)));
+      const minPopulation = Math.pow(10, 0.6 * minMagnitude);
+      const maxPopulation = Math.pow(10, 0.6 * limitingMagnitude);
+      stars = Array.from({ length: count }, () => {
+        const population = minPopulation + Math.random() * (maxPopulation - minPopulation);
+        const magnitude = Math.log10(population) / 0.6;
+        const flux = Math.pow(10, -0.4 * (magnitude - minMagnitude));
+        const temperature = Math.random();
+        return {
+          x: Math.random() * width,
+          y: Math.random() * height,
+          magnitude,
+          radius: 0.38 + Math.pow(flux, 0.2) * 1.55,
+          alpha: 0.09 + Math.pow(flux, 0.22) * 0.78,
+          phase: Math.random() * Math.PI * 2,
+          speed: 0.0001 + Math.random() * 0.00016,
+          amplitude: (twinkle / 100) * (0.025 + Math.random() * 0.075),
+          color: temperature < 0.16 ? "255,183,196" : temperature > 0.84 ? "218,226,255" : "255,244,242",
+        };
+      });
+    }
+
+    function resize() {
+      width = window.innerWidth;
+      height = window.innerHeight;
+      pixelRatio = Math.min(window.devicePixelRatio || 1, 1.6);
+      surface.width = Math.round(width * pixelRatio);
+      surface.height = Math.round(height * pixelRatio);
+      surface.style.width = `${width}px`;
+      surface.style.height = `${height}px`;
+      drawing.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      rebuildStars();
+    }
+
+    function paint(time: number) {
+      if (time - lastPaint < 42 && !reduceMotion) {
+        animationFrame = requestAnimationFrame(paint);
+        return;
+      }
+      lastPaint = time;
+      drawing.clearRect(0, 0, width, height);
+      for (const star of stars) {
+        const pulse = reduceMotion ? 0 : Math.sin(time * star.speed + star.phase) * star.amplitude;
+        const alpha = Math.max(0.035, Math.min(0.96, star.alpha + pulse));
+        if (star.magnitude < 1.4) {
+          const glow = drawing.createRadialGradient(star.x, star.y, 0, star.x, star.y, star.radius * 5.5);
+          glow.addColorStop(0, `rgba(${star.color},${alpha * 0.62})`);
+          glow.addColorStop(0.2, `rgba(255,37,70,${alpha * 0.14})`);
+          glow.addColorStop(1, "rgba(255,0,32,0)");
+          drawing.fillStyle = glow;
+          drawing.beginPath();
+          drawing.arc(star.x, star.y, star.radius * 5.5, 0, Math.PI * 2);
+          drawing.fill();
+        }
+        drawing.fillStyle = `rgba(${star.color},${alpha})`;
+        drawing.beginPath();
+        drawing.arc(star.x, star.y, star.radius, 0, Math.PI * 2);
+        drawing.fill();
+      }
+      if (!reduceMotion) animationFrame = requestAnimationFrame(paint);
+    }
+
+    resize();
+    paint(0);
+    window.addEventListener("resize", resize, { passive: true });
+    return () => {
+      window.removeEventListener("resize", resize);
+      cancelAnimationFrame(animationFrame);
+    };
+  }, [active, overlay, density, limitingMagnitude, twinkle]);
+
+  return <div className="deep-space-backdrop" aria-hidden="true" style={{ "--sky-image": `url("${imageUrl}")` } as React.CSSProperties}>{overlay && <canvas ref={canvasRef}/>}<span className="space-vignette"/></div>;
 }
 
 function toResult(item: Record<string, unknown>, index: number): SearchResult {
@@ -126,6 +275,7 @@ function toResult(item: Record<string, unknown>, index: number): SearchResult {
 export default function Home() {
   const [view, setView] = useState<View>("search");
   const [settings, setSettings] = useState<Settings>(defaultSettings);
+  const [skyFrame, setSkyFrame] = useState<SkyFrame>(fallbackSkyFrame);
   const [query, setQuery] = useState("WSL2 中的部署与故障排查");
   const [scope, setScope] = useState("all");
   const [alpha, setAlpha] = useState(65);
@@ -138,8 +288,6 @@ export default function Home() {
   const [answering, setAnswering] = useState(false);
   const [sessionId, setSessionId] = useState("local-main");
   const [memoryText, setMemoryText] = useState("");
-  const [ingestPath, setIngestPath] = useState("/opt/global-rag/kb");
-  const [ingestText, setIngestText] = useState("");
   const [health, setHealth] = useState<Record<ServiceKey, HealthState>>({ gateway: "online", weaviate: "online", embedding: "online", vllm: "online" });
   const [lastCheck, setLastCheck] = useState("刚刚");
 
@@ -154,6 +302,23 @@ export default function Home() {
     let cancelled = false;
     queueMicrotask(() => { if (!cancelled) setSettings(restored); });
     return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function refreshSky() {
+      try {
+        const response = await fetch("/api/sky/latest", { cache: "no-store" });
+        if (!response.ok) return;
+        const payload = await response.json() as SkyFrame;
+        if (!cancelled) setSkyFrame({ ...fallbackSkyFrame, ...payload });
+      } catch {
+        // Keep the bundled scientific frame when the hourly updater is unavailable.
+      }
+    }
+    refreshSky();
+    const timer = window.setInterval(refreshSky, 60 * 60 * 1000);
+    return () => { cancelled = true; window.clearInterval(timer); };
   }, []);
 
   useEffect(() => {
@@ -211,12 +376,10 @@ export default function Home() {
       setLastCheck("刚刚");
       return;
     }
-    const checks: ( [ServiceKey, string, Record<string, string>?] )[] = [
+    const checks: [ServiceKey, string, Record<string, string>?][] = [
       ["gateway", `${settings.gatewayUrl}/health`],
-      ["weaviate", `${settings.weaviateUrl}/.well-known/ready`, settings.apiKey ? { Authorization: `Bearer ${settings.apiKey}` } : undefined],
-      ...(settings.embeddingUrl
-        ? [["embedding", `${settings.embeddingUrl}/api/tags`]] as [ServiceKey, string][]
-        : []),
+      ["weaviate", `${settings.weaviateUrl}/v1/.well-known/ready`, settings.apiKey ? { Authorization: `Bearer ${settings.apiKey}` } : undefined],
+      ["embedding", `${settings.embeddingUrl}/api/tags`],
       ["vllm", `${settings.vllmUrl}/health`],
     ];
     const states = await Promise.all(checks.map(async ([key, url, headers]) => {
@@ -271,8 +434,19 @@ export default function Home() {
     } catch (error) { flash(error instanceof Error ? error.message : "请求失败"); }
   }
 
+  const skyCapturedLabel = new Date(skyFrame.capturedAt).toLocaleString("zh-CN", {
+    month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", timeZone: "UTC", hour12: false,
+  });
+
   return (
-    <main className="app-shell">
+    <main
+      className={`app-shell ${settings.theme === "night" ? "theme-night" : "theme-light"}`}
+      style={{
+        "--glass-alpha": (settings.glassOpacity / 100).toFixed(2),
+        "--galaxy-exposure": (settings.galaxyExposure / 100).toFixed(2),
+      } as React.CSSProperties}
+    >
+      <DeepSpaceBackdrop active={settings.theme === "night"} overlay={settings.syntheticOverlay} imageUrl={skyFrame.imageUrl} density={settings.stellarDensity} limitingMagnitude={settings.limitingMagnitude} twinkle={settings.twinkleStrength}/>
       <aside className="sidebar">
         <div className="brand" aria-label="全局 RAG 检索工作台">
           <span className="brand-seal">检</span>
@@ -296,7 +470,7 @@ export default function Home() {
         <header className="topbar">
           <div className="mobile-brand"><span className="brand-seal">检</span><b>归藏</b></div>
           <div className="service-strip">
-            {([ ["weaviate", "Weaviate", "1.38"], ["embedding", "Embedding", "BGE-M3"], ["vllm", "llama-server", "Gemma 4"] ] as [ServiceKey, string, string][]).map(([key, label, meta]) => (
+            {([ ["weaviate", "Weaviate", "1.38"], ["embedding", "Embedding", "BGE-M3"], ["vllm", "vLLM", "32B"] ] as [ServiceKey, string, string][]).map(([key, label, meta]) => (
               <button key={key} onClick={() => setView("status")} className="service-pill" title={`查看 ${label} 服务状态`}>
                 <span className={`status-dot ${health[key]}`}/><span>{label}</span><small>{meta}</small>
               </button>
@@ -304,9 +478,24 @@ export default function Home() {
           </div>
           <div className="top-actions">
             <span className="session-label">会话 · {sessionId}</span>
+            <button
+              className="quiet-button theme-toggle"
+              aria-pressed={settings.theme === "night"}
+              onClick={() => saveSettings({ ...settings, theme: settings.theme === "night" ? "light" : "night" })}
+              title={settings.theme === "night" ? "切换到日间模式" : "切换到深空模式"}
+            >
+              <Icon name={settings.theme === "night" ? "sun" : "moon"} size={18}/><span>{settings.theme === "night" ? "日间模式" : "深空模式"}</span>
+            </button>
             <button className="quiet-button" onClick={() => setView("settings")}><Icon name="settings" size={18}/><span>连接设置</span></button>
           </div>
         </header>
+
+        {settings.theme === "night" && <a className="sky-telemetry" href={skyFrame.sourcePage} target="_blank" rel="noreferrer" title={`科学帧 ${skyFrame.dpId}`}>
+          <span className={`sky-live-dot ${skyFrame.isFallback ? "fallback" : "live"}`}/>
+          <span><b>{skyFrame.isFallback ? "最近可用夜空" : "每小时实时帧"}</b><small>{skyFrame.instrument} · Paranal · {skyCapturedLabel} UTC</small></span>
+          <span><b>{skyFrame.sqmZen.toFixed(2)}</b><small>mag/arcsec²</small></span>
+          <span><b>{skyFrame.sourceWidth}²</b><small>原始像素</small></span>
+        </a>}
 
         {view === "search" && (
           <div className="page search-page">
@@ -372,27 +561,7 @@ export default function Home() {
           </div>
         )}
 
-        {view === "library" && (
-          <div className="page inner-page">
-            <PageTitle kicker="KNOWLEDGE BASE" title="知识入库" description="增量解析文件目录或直接写入文本；路径、哈希和切片编号用于去重。"/>
-            <div className="two-column-panels">
-              <section className="paper-panel"><PanelHeading number="壹" title="索引本地目录" text="后端会递归扫描支持的文档，并仅更新发生变化的来源。"/>
-                <label className="field"><span>WSL2 路径</span><input value={ingestPath} onChange={(e) => setIngestPath(e.target.value)}/></label>
-                <div className="format-row"><span>PDF</span><span>DOCX</span><span>Markdown</span><span>代码</span><span>纯文本</span></div>
-                <button className="primary-button compact" onClick={() => postGateway("/v1/ingest/path", { path: ingestPath, scope: "global" }, "目录已加入索引队列")}><Icon name="plus"/>加入索引队列</button>
-              </section>
-              <section className="paper-panel"><PanelHeading number="贰" title="写入一段知识" text="适合临时笔记、操作记录和无法保存为文件的说明。"/>
-                <label className="field"><span>标题与正文</span><textarea value={ingestText} onChange={(e) => setIngestText(e.target.value)} placeholder="输入要写入知识库的内容…"/></label>
-                <button disabled={!ingestText.trim()} className="primary-button compact" onClick={() => { postGateway("/v1/ingest/text", { title: "工作台手动记录", content: ingestText, scope: "private" }, "文本已写入知识库"); setIngestText(""); }}><Icon name="plus"/>写入知识库</button>
-              </section>
-            </div>
-            <section className="paper-panel sources-panel"><div className="panel-row"><PanelHeading number="叁" title="最近来源" text="按来源文件查看索引状态与切片数量。"/><span className="total-chip">2 个来源 · 112 个切片</span></div>
-              <div className="source-table"><div className="table-head"><span>来源</span><span>范围</span><span>切片</span><span>更新时间</span><span/></div>
-                {[ ["WSL2-Global-RAG-Deployment-CN.md", "全局知识库", "86", "今天 18:42"], ["README_WSL2_vLLM_32B.md", "部署文档目录", "26", "今天 18:37"] ].map((row) => <div className="table-row" key={row[0]}><span><b>{row[0]}</b><small>{row[1]}</small></span><span>global</span><span>{row[2]}</span><span>{row[3]}</span><button title="删除来源" onClick={() => flash("演示模式未删除真实数据")}><Icon name="trash" size={17}/></button></div>)}
-              </div>
-            </section>
-          </div>
-        )}
+        {view === "library" && <KnowledgeWorkbench demoMode={settings.demoMode} gatewayUrl={settings.gatewayUrl} apiKey={settings.apiKey} onNotice={flash}/>} 
 
         {view === "memory" && (
           <div className="page inner-page">
@@ -414,7 +583,7 @@ export default function Home() {
           <div className="page inner-page">
             <div className="title-row"><PageTitle kicker="SYSTEM PULSE" title="服务状态" description={`上次检查：${lastCheck}。状态检测只读取健康端点，不修改服务。`}/><button className="outline-button" onClick={checkHealth}><Icon name="pulse"/>重新检查</button></div>
             <div className="status-grid">
-              {([ ["gateway", "RAG Gateway", settings.gatewayUrl, "检索、入库与权限封装", "12 ms"], ["weaviate", "Weaviate", settings.weaviateUrl, "BM25 + HNSW 混合索引", "18 ms"], ["embedding", "BGE-M3", settings.embeddingUrl, "FlagEmbedding · CPU 推理", "内置"], ["vllm", "llama-server (Gemma 4)", settings.vllmUrl, "双 3090 · Q4_K_M GGUF", "在线"] ] as [ServiceKey, string, string, string, string][]).map(([key, title, url, description, metric], i) => <article className="status-card" key={key}><div className="status-card-top"><span className="ordinal">{["壹", "贰", "叁", "肆"][i]}</span><span className={`large-status ${health[key]}`}>{health[key] === "checking" ? "检查中" : health[key] === "online" ? "运行正常" : "无法连接"}</span></div><h2>{title}</h2><p>{description}</p><code>{url}</code><footer><span>当前指标</span><b>{health[key] === "online" ? metric : "—"}</b></footer></article>)}
+              {([ ["gateway", "RAG Gateway", settings.gatewayUrl, "检索、入库与权限封装", "12 ms"], ["weaviate", "Weaviate", settings.weaviateUrl, "BM25 + HNSW 混合索引", "18 ms"], ["embedding", "BGE-M3", settings.embeddingUrl, "1024 维 · CPU 推理", "106 ms"], ["vllm", "Qwen2.5-32B", settings.vllmUrl, "双 3090 · GPTQ INT4", "24 tok/s"] ] as [ServiceKey, string, string, string, string][]).map(([key, title, url, description, metric], i) => <article className="status-card" key={key}><div className="status-card-top"><span className="ordinal">{["壹", "贰", "叁", "肆"][i]}</span><span className={`large-status ${health[key]}`}>{health[key] === "checking" ? "检查中" : health[key] === "online" ? "运行正常" : "无法连接"}</span></div><h2>{title}</h2><p>{description}</p><code>{url}</code><footer><span>当前指标</span><b>{health[key] === "online" ? metric : "—"}</b></footer></article>)}
             </div>
             <section className="paper-panel resource-panel"><PanelHeading number="监" title="资源边界" text="按部署文档设定的本机资源上限。"/><div className="resource-bars"><ResourceBar label="Weaviate 内存" value="8.7 / 14 GB" width="62%"/><ResourceBar label="Embedding 内存" value="3.2 / 6 GB" width="53%"/><ResourceBar label="向量容量" value="0.34 / 0.8 M" width="42%"/></div></section>
           </div>
@@ -433,6 +602,23 @@ export default function Home() {
                 <label className="field"><span>Weaviate / Gateway API Key</span><input type="password" value={settings.apiKey} placeholder="至少 32 字节" onChange={(e) => setSettings({ ...settings, apiKey: e.target.value })}/></label>
                 <label className="field"><span>vLLM 模型名称</span><input value={settings.model} onChange={(e) => setSettings({ ...settings, model: e.target.value })}/></label>
               </div>
+              <section className="space-settings">
+                <div className="space-settings-head"><div><span className="section-kicker">DEEP SPACE DISPLAY</span><h2>深空显示参数</h2></div><span>实时预览</span></div>
+                <p>背景来自 ESO 帕拉纳尔 ALPACA 实拍科学帧，每小时检查一次；当地白天或质量不足时保留最近合格夜空并明确标识。</p>
+                <div className="sky-source-card">
+                  <span className="sky-source-mark">ESO</span>
+                  <div><b>ALPACA 全天空科学帧</b><small>{skyFrame.dpId} · SQM {skyFrame.sqmZen.toFixed(2)} mag/arcsec² · {skyFrame.sourceWidth} × {skyFrame.sourceHeight}</small></div>
+                  <button className={settings.syntheticOverlay ? "enabled" : ""} onClick={() => setSettings({ ...settings, syntheticOverlay: !settings.syntheticOverlay })}><i/><span>{settings.syntheticOverlay ? "氛围增强已开" : "科研原图模式"}</span></button>
+                </div>
+                <p className="overlay-disclosure">“科研原图模式”不添加合成星。开启“氛围增强”后，以下星等与闪烁参数只控制 Canvas 视觉层，不改写科学帧，也不会被标记为观测数据。</p>
+                <div className={`space-control-grid ${settings.syntheticOverlay ? "" : "controls-muted"}`}>
+                  <SpaceControl label="星场密度" value={settings.stellarDensity} min={0.45} max={2} step={0.05} unit="×" onChange={(value) => setSettings({ ...settings, stellarDensity: value })}/>
+                  <SpaceControl label="极限视星等" value={settings.limitingMagnitude} min={5} max={9} step={0.1} unit="m" onChange={(value) => setSettings({ ...settings, limitingMagnitude: value })}/>
+                  <SpaceControl label="闪烁幅度" value={settings.twinkleStrength} min={0} max={100} step={1} unit="%" onChange={(value) => setSettings({ ...settings, twinkleStrength: value })}/>
+                  <SpaceControl label="玻璃不透明度" value={settings.glassOpacity} min={12} max={48} step={1} unit="%" onChange={(value) => setSettings({ ...settings, glassOpacity: value })}/>
+                  <SpaceControl label="银河曝光" value={settings.galaxyExposure} min={45} max={120} step={1} unit="%" onChange={(value) => setSettings({ ...settings, galaxyExposure: value })}/>
+                </div>
+              </section>
               <div className="settings-actions"><button className="outline-button" onClick={checkHealth}><Icon name="pulse"/>测试连接</button><button className="primary-button compact" onClick={() => { saveSettings(settings); flash("设置已保存在当前浏览器"); }}><Icon name="check"/>保存设置</button></div>
               <p className="security-note">建议仅绑定 127.0.0.1，并由 Gateway 统一处理 CORS、鉴权和 scope 过滤。远程打开此界面时，浏览器可能阻止访问本机 HTTP 服务。</p>
             </section>
@@ -454,4 +640,9 @@ function PanelHeading({ number, title, text }: { number: string; title: string; 
 
 function ResourceBar({ label, value, width }: { label: string; value: string; width: string }) {
   return <div className="resource-bar"><div><span>{label}</span><b>{value}</b></div><i><em style={{ width }}/></i></div>;
+}
+
+function SpaceControl({ label, value, min, max, step, unit, onChange }: { label: string; value: number; min: number; max: number; step: number; unit: string; onChange: (value: number) => void }) {
+  const percentage = ((value - min) / (max - min)) * 100;
+  return <label className="space-control"><span><b>{label}</b><output>{Number.isInteger(step) ? value.toFixed(0) : value.toFixed(step < 0.1 ? 2 : 1)} {unit}</output></span><input type="range" min={min} max={max} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} style={{ "--range": `${percentage}%` } as React.CSSProperties}/></label>;
 }

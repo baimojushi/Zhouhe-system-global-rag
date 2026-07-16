@@ -7,4 +7,25 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:3000:3000"
+    volumes:
+      - sky-cache:/app/data/sky:ro
     init: true
+    depends_on:
+      - sky-updater
+
+  sky-updater:
+    build:
+      context: .
+      dockerfile: Dockerfile.sky
+    container_name: global-rag-sky-updater
+    restart: unless-stopped
+    environment:
+      SKY_UPDATE_SECONDS: "3600"
+      SKY_MIN_SQM_ZEN: "21.8"
+      SKY_DISPLAY_SIZE: "3840"
+      SKY_WEBP_QUALITY: "88"
+    volumes:
+      - sky-cache:/data/sky
+
+volumes:
+  sky-cache:

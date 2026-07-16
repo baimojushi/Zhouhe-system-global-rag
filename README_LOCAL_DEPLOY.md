@@ -1,0 +1,190 @@
+# 全局 RAG 检索工作台：本地部署
+
+这是 GUI 的完整本地部署包。默认开启演示模式，无需后端即可检查所有页面和交互；切换到“本地服务”后，界面会调用 WSL2 中的 RAG Gateway、Weaviate、Embedding 和 vLLM。
+
+## 一、直接使用 Node.js（推荐开发和调试）
+
+要求：Node.js 22.13 或更高版本。
+
+```bash
+cd global-rag-console-local
+
+# 大陆网络可选
+npm config set registry https://registry.npmmirror.com
+
+npm ci
+npm run build
+npm start
+```
+
+浏览器打开：<http://127.0.0.1:3000>
+
+保持服务运行，再开一个终端执行界面自检：
+
+```bash
+npm run verify:ui
+```
+
+只有出现“UI 自检通过”才表示主页与 CSS 产品样式均部署成功。仅能看到文字、默认按钮和纵向堆叠内容，不属于正常界面。
+
+开发模式：
+
+```bash
+npm run dev
+```
+
+## 二、使用 Docker Compose
+
+```bash
+cd global-rag-console-local
+docker compose -f docker-compose.local.yml up -d --build
+docker compose -f docker-compose.local.yml logs -f
+docker compose -f docker-compose.local.yml ps
+```
+
+浏览器打开：<http://127.0.0.1:3000>
+
+停止 GUI：
+
+```bash
+docker compose -f docker-compose.local.yml down
+```
+
+Compose 同时启动 GUI 和 `sky-updater`。后者每小时查询 ESO ALPACA，将最新合格科学帧转换为 4K WebP 并写入只读共享卷；更新失败不会覆盖上一帧。RAG 请求仍由浏览器发起，所以设置中的后端地址填写 `127.0.0.1`，不要填写 Docker 容器名。
+
+容器内置 UI 健康检查；`docker compose ... ps` 应显示 `healthy`。如果升级后仍显示旧页面，使用无缓存方式重建：
+
+```bash
+docker compose -f docker-compose.local.yml build --no-cache
+docker compose -f docker-compose.local.yml up -d --force-recreate
+```
+
+## 三、连接真实后端
+
+打开 GUI 的“设置”，关闭“演示模式”，确认以下默认端点：
+
+| 服务 | 默认地址 |
+|---|---|
+| RAG Gateway | `http://127.0.0.1:8090` |
+| Weaviate | `http://127.0.0.1:8080` |
+| Embedding / Ollama | `http://127.0.0.1:11434` |
+| vLLM | `http://127.0.0.1:8000` |
+
+填入 Gateway/Weaviate API Key 和 vLLM 实际模型名称，然后保存并测试连接。
+
+设置只保存在浏览器 `localStorage` 中，不会写入源码。高安全环境不建议让浏览器长期保存管理级密钥；可由 Gateway 使用单独的前端低权限令牌。
+
+## 四、Gateway API 约定
+
+部署文档只定义了端点，没有固定 JSON 字段。本 GUI 使用以下约定。
+
+### 检索
+
+`POST /v1/retrieve`
+
+```json
+{
+  "query": "WSL2 中的部署与故障排查",
+  "scope": "global",
+  "alpha": 0.65,
+  "top_k": 6,
+  "session_id": "local-main"
+}
+```
+
+响应可以将数组放在 `results`、`items` 或 `data` 中。每一项建议包含：
+
+```json
+{
+  "id": "chunk-id",
+  "score": 0.94,
+  "title": "文档标题",
+  "heading": "章节标题",
+  "content": "检索片段",
+  "source_path": "/opt/global-rag/kb/example.md",
+  "source_name": "example.md",
+  "page": 12,
+  "scope": "global",
+  "mime_type": "text/markdown"
+}
+```
+
+也支持 Weaviate 风格的 `{ "properties": { ... } }` 包装。
+
+### 入库和记忆
+
+- `POST /v1/ingest/path`：`{ "path": "...", "library_id": "production", "target_node": "production-unclassified", "classification": "manual-major-category" }`
+- `POST /v1/ingest/text`：`{ "title": "...", "content": "...", "scope": "private" }`
+- `POST /v1/memory`：`{ "content": "...", "session_id": "...", "memory_type": "decision", "importance": 0.8, "scope": "private" }`
+- `POST /v1/taxonomy/proposals`：生成目录变更预览，不移动文件。
+- `POST /v1/taxonomy/proposals/:id/apply`：使用目录版本锁应用人工确认的变更。
+- `POST /v1/associations/discover`：生成跨库候选关系边。
+- `GET /health`
+
+如果现有 Gateway 字段不同，只需调整 `app/page.tsx` 中的 `runSearch` 和 `postGateway`。
+
+## 五、配置 CORS
+
+浏览器必须获得 Gateway 的跨域许可。FastAPI 示例：
+
+```python
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://127.0.0.1:3000",
+        "http://localhost:3000",
+    ],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+```
+
+建议浏览器只访问 Gateway，由 Gateway 代为访问 Weaviate、Embedding 和 vLLM。当前 GUI 的健康检查会直接读取各服务端点，因此这些服务若未开放 CORS，只有相应状态检查会显示离线，不影响通过 Gateway 检索。
+
+## 六、安全建议
+
+- 所有端口仅绑定 `127.0.0.1`。
+- Gateway 强制校验 `scope` 和 `session_id`。
+- 不把 Weaviate 管理密钥写入前端源码或 Docker 镜像。
+- 生产使用时让 Gateway 提供健康状态聚合，减少浏览器直接访问底层服务。
+- MCP 写入接口保持关闭，知识库管理操作只允许人工界面调用。
+
+## 七、界面样式故障排查
+
+如果页面退化成浏览器默认样式：
+
+1. 先运行 `npm run verify:ui`，不要继续进行业务验收。
+2. 浏览器按 `Ctrl+F5` 强制刷新，排除旧 HTML 与旧 CSS 缓存混用。
+3. 打开开发者工具的 Network，确认 `/_next/static/css/*.css` 返回 HTTP 200 且类型为 `text/css`。
+4. 使用 Docker 时按上面的无缓存命令重建，避免复用旧镜像层。
+5. 如果前面还有 Nginx，必须把 `/_next/` 与主页代理到同一个 GUI 服务，不要只代理 `/`。
+
+本地部署已使用标准 Next.js 运行链，不需要 Vinext、Vite 或 Tailwind 运行时。
+
+## 八、真实夜空夜间模式
+
+顶部工具栏的“深空模式”用于切换红黑透明舷窗主题。主题选择与视觉参数保存在当前浏览器，不改变后端服务配置。
+
+夜空数据来自 ESO ALPACA 实拍 FITS，UI 显示观测 ID、UTC 拍摄时间、原始像素和 `sqm_zen`。完整更新与降级策略见 `REALTIME_SKY_BACKGROUND.md`。
+
+可在“设置 → 深空显示参数”调节：
+
+- 科研原图 / 氛围增强：默认科研原图不添加合成星；开启后才启用以下三个模拟参数。
+- 星场密度：控制氛围增强层中的程序化星点数量。
+- 极限视星等：范围 `5.0–9.0 m`；数值越高，模拟层加入的暗星越多。
+- 闪烁幅度：只改变氛围层的微弱亮度波动，周期保持在约 20–60 秒。
+- 玻璃不透明度：控制功能容器的遮罩强度；页面间隙始终完全透明。
+- 银河曝光：控制真实全天空帧的显示亮度，不改写原文件。
+
+系统开启“减少动态效果”时，星场会自动停止闪烁并保持静态。背景图片的来源与署名见 `THIRD_PARTY_ASSETS.md`。
+
+## 九、知识库工作台
+
+管理界面采用已确认的 A 方案：多级目录树、每库独立 collection、工作台 + 详情抽屉。预制大类包括 AI 工作记录、学术资料、生产文档、个人思维笔记与关联知识库。
+
+新文件先由用户选择前四个文档库之一，并进入该库的“未归类”。只有点击“AI 自动归类”后才调用远程闭源模型；返回结果先在详情抽屉预审，低置信度内容继续保留未归类。关联知识库只存跨库关系边和证据指针。
+
+后端数据模型、API、隐私边界和每批 Token 预算见 `BACKEND_KNOWLEDGE_ITERATION_PLAN.md`。
