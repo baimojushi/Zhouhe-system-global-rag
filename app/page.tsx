@@ -3,26 +3,18 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { KnowledgeWorkbench } from "./knowledge-workbench";
 
-// Classical Chinese two-character phrases, randomly selected per page load
+// Classical phrases containing 宙合, from 《管子·宙合》and related texts
 const classicalPhrases = [
-  "守拙", "知止", "归真", "素心", "无涯", "问道", "格物", "致知",
-  "明德", "至善", "玄览", "守静", "见素", "抱朴", "不争", "上善",
-  "若水", "观复", "归根", "知常", "见微", "知著", "浮生", "执念",
-  "中庸", "大道", "玄牝", "栖迟", "诚意", "正心", "修身", "慎独",
-  "博文", "约礼", "游丝", "有涯", "知足", "善渊", "处下", "含德",
-  "含章", "可贞", "明夷", "谦光", "豫行", "随风", "蛊弊", "临民",
-  "观国", "噬嗑", "贲饰", "剥复", "无妄", "大畜", "颐养", "坎习",
-  "离明", "咸感", "恒久", "遁世", "大壮", "晋明", "家人正", "睽异",
-  "蹇难", "解惑", "损益", "夬决", "姤遇", "萃聚", "升进", "困穷",
-  "井养", "革故", "鼎新", "震动", "艮止", "渐进", "归妹", "丰盈",
-  "旅寓", "巽入", "兑说", "涣散", "节制", "中孚", "小过", "既济",
-  "未济", "乾坤", "泰和", "否闭", "同人", "大有", "谦益", "豫备",
-  "随缘", "蛊惑", "临事", "观象", "噬合", "贲华", "剥落", "复始",
-  "无咎", "大畜", "颐和", "坎陷", "离照", "咸通", "恒常", "遁藏",
-  "壮志", "晋升", "家人", "睽违", "蹇涩", "解颐", "损谦", "夬断",
-  "姤合", "萃华", "升腾", "困顿", "井渫", "革面", "鼎立", "震恐",
-  "艮石", "渐悟", "归藏", "丰年", "旅途", "巽风", "兑泽", "涣然",
-  "节操", "信孚", "过化", "济川", "未央",
+  "宙合之意",   // 《管子·宙合》: "宙合之意，上通于天"
+  "宙合之道",   // 宙合之道 — the way of universal union
+  "宙合以道",   // 《管子》: 以道宙合
+  "通宙合",     // 通达宙合 — connect universal union
+  "达宙合",     // 达于宙合 — reach universal union
+  "宙合之上",   // 《管子·宙合》: 宙合之上
+  "宙合之下",   // 《管子·宙合》: 宙合之下
+  "宙合不弊",   // 《管子·宙合》: 宙合而不弊
+  "宙合以成",   // 以宙合成之 — complete through universal union
+  "宙合载焉",   // 《管子》: 万物宙合载焉
 ];
 
 function randomPhrase(): string {
@@ -618,7 +610,7 @@ export default function Home() {
           <div className="page search-page">
             <section className="search-column">
               <div className="eyebrow"><span/>宙合 · GLOBAL RETRIEVAL</div>
-              <h1>{heroPhrase}，<br/><em>找到可信依据。</em></h1>
+              <h1>宙合 · {heroPhrase}，<br/><em>找到可信依据。</em></h1>
               <p className="intro">混合召回文件知识与历史上下文，保留每一条答案的来源、章节和路径。</p>
 
               <form onSubmit={runSearch} className="search-form">
