@@ -46,7 +46,7 @@ const defaultSettings: Settings = {
   glassOpacity: 24,
   galaxyExposure: 82,
   syntheticOverlay: false,
-  gatewayUrl: "http://127.0.0.1:8090",
+  gatewayUrl: "http://127.0.0.1:9100",
   weaviateUrl: "http://127.0.0.1:8080",
   embeddingUrl: "http://127.0.0.1:11434",
   vllmUrl: "http://127.0.0.1:8000",

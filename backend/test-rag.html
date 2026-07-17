@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RAG 后端测试工具</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0f; color: #e0e0e0; padding: 20px; }
+  h1 { font-size: 1.6em; margin-bottom: 6px; }
+  .subtitle { color: #888; margin-bottom: 24px; }
+  .card { background: #16161e; border: 1px solid #2a2a3a; border-radius: 10px; padding: 20px; margin-bottom: 16px; }
+  .card h2 { font-size: 1.1em; margin-bottom: 12px; color: #7c83ff; }
+  label { display: block; font-size: 0.85em; color: #aaa; margin-bottom: 4px; }
+  input[type="text"], input[type="password"] {
+    width: 100%; padding: 8px 12px; background: #0d0d14; border: 1px solid #333; border-radius: 6px;
+    color: #e0e0e0; font-size: 0.95em; margin-bottom: 12px;
+  }
+  button {
+    padding: 10px 20px; border: none; border-radius: 6px; font-size: 0.9em; cursor: pointer;
+    background: #4a52ff; color: white; margin-right: 8px; margin-bottom: 8px;
+  }
+  button:hover { background: #3a42ef; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .result { background: #0d0d14; border: 1px solid #222; border-radius: 6px; padding: 12px; margin-top: 12px;
+    font-family: 'Courier New', monospace; font-size: 0.85em; white-space: pre-wrap; max-height: 400px; overflow-y: auto; color: #b0b0c0; }
+  .status-ok { color: #4ade80; font-weight: bold; }
+  .status-err { color: #f87171; font-weight: bold; }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; }
+  .col { flex: 1; min-width: 250px; }
+  .health-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-top: 12px; }
+  .health-item { background: #0d0d14; border-radius: 6px; padding: 12px; text-align: center; }
+  .health-item .label { font-size: 0.8em; color: #888; margin-bottom: 4px; }
+  .health-item .value { font-size: 1.1em; font-weight: bold; }
+  .health-item .detail { font-size: 0.75em; color: #666; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+<h1>🔍 归藏 RAG 后端测试工具</h1>
+<p class="subtitle">诊断后端服务连接问题（不依赖 Next.js 前端）</p>
+
+<div class="card">
+  <h2>连接配置</h2>
+  <div class="row">
+    <div class="col">
+      <label>RAG Gateway 地址</label>
+      <input type="text" id="gatewayUrl" value="http://127.0.0.1:9100">
+    </div>
+    <div class="col">
+      <label>Weaviate API Key</label>
+      <input type="password" id="apiKey" placeholder="填入 Weaviate API Key">
+    </div>
+  </div>
+  <button onclick="runHealthCheck()">测试所有连接</button>
+  <button onclick="testRetrieve()">测试检索</button>
+  <button onclick="testSearchKnowledge()">测试 MCP 工具</button>
+</div>
+
+<div class="card">
+  <h2>健康状态</h2>
+  <div class="health-grid" id="healthGrid">
+    <div class="health-item"><div class="label">RAG Gateway</div><div class="value" id="h_gateway">—</div><div class="detail" id="d_gateway"></div></div>
+    <div class="health-item"><div class="label">Weaviate</div><div class="value" id="h_weaviate">—</div><div class="detail" id="d_weaviate"></div></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>检索测试</h2>
+  <label>搜索查询</label>
+  <input type="text" id="queryText" value="WSL2 部署与故障排查">
+  <label>语义权重 (0-100)</label>
+  <input type="text" id="alphaValue" value="65">
+  <label>返回数量</label>
+  <input type="text" id="topKValue" value="6">
+  <button onclick="testRetrieve()">执行检索</button>
+  <div class="result" id="retrieveResult">等待检索...</div>
+</div>
+
+<div class="card">
+  <h2>MCP 工具调用</h2>
+  <label>搜索查询</label>
+  <input type="text" id="mcpQuery" value="GPU 显存不足">
+  <button onclick="testSearchKnowledge()">调用 search_knowledge</button>
+  <div class="result" id="mcpResult">等待调用...</div>
+</div>
+
+<script>
+async function api(path, body) {
+  const gatewayUrl = document.getElementById('gatewayUrl').value.replace(/\/$/, '');
+  const apiKey = document.getElementById('apiKey').value;
+  const headers = { 'Content-Type': 'application/json' };
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+  const resp = await fetch(gatewayUrl + path, { method: 'POST', headers, body: JSON.stringify(body) });
+  const text = await resp.text();
+  try { return { ok: resp.ok, status: resp.status, data: JSON.parse(text), raw: text }; }
+  catch { return { ok: resp.ok, status: resp.status, data: null, raw: text }; }
+}
+
+function setResult(elId, result) {
+  const el = document.getElementById(elId);
+  if (result.ok) {
+    el.className = 'result status-ok';
+    el.textContent = result.raw;
+  } else {
+    el.className = 'result status-err';
+    el.textContent = `HTTP ${result.status}\n${result.raw}`;
+  }
+}
+
+async function runHealthCheck() {
+  const gatewayUrl = document.getElementById('gatewayUrl').value.replace(/\/$/, '');
+  const apiKey = document.getElementById('apiKey').value;
+  
+  // Check Gateway
+  try {
+    const r = await fetch(gatewayUrl + '/health');
+    const d = await r.json();
+    document.getElementById('h_gateway').textContent = r.ok ? '● 在线' : '● 异常';
+    document.getElementById('h_gateway').className = 'value ' + (r.ok ? 'status-ok' : 'status-err');
+    document.getElementById('d_gateway').textContent = JSON.stringify(d);
+  } catch(e) {
+    document.getElementById('h_gateway').textContent = '● 离线';
+    document.getElementById('h_gateway').className = 'value status-err';
+    document.getElementById('d_gateway').textContent = e.message;
+  }
+  
+  // Check Weaviate
+  try {
+    const r = await fetch('http://127.0.0.1:8080/v1/.well-known/ready', {
+      headers: apiKey ? { 'X-Weaviate-Api-Key': apiKey } : {}
+    });
+    document.getElementById('h_weaviate').textContent = r.ok ? '● 在线' : '● 异常';
+    document.getElementById('h_weaviate').className = 'value ' + (r.ok ? 'status-ok' : 'status-err');
+    document.getElementById('d_weaviate').textContent = await r.text();
+  } catch(e) {
+    document.getElementById('h_weaviate').textContent = '● 离线';
+    document.getElementById('h_weaviate').className = 'value status-err';
+    document.getElementById('d_weaviate').textContent = e.message;
+  }
+}
+
+async function testRetrieve() {
+  const query = document.getElementById('queryText').value;
+  const alpha = parseInt(document.getElementById('alphaValue').value) / 100;
+  const topK = parseInt(document.getElementById('topKValue').value);
+  setResult('retrieveResult', '正在检索 ' + query + '...');
+  const result = await api('/v1/retrieve', { query, alpha, top_k: topK, scope: 'global' });
+  setResult('retrieveResult', result);
+}
+
+async function testSearchKnowledge() {
+  const query = document.getElementById('mcpQuery').value;
+  setResult('mcpResult', '正在调用 search_knowledge...');
+  const result = await api('/v1/retrieve/search_knowledge', { query, scope: 'global', top_k: 5 });
+  setResult('mcpResult', result);
+}
+</script>
+
+</body>
+</html>
