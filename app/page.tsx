@@ -5,7 +5,7 @@ import { KnowledgeWorkbench } from "./knowledge-workbench";
 
 type View = "search" | "library" | "memory" | "status" | "settings";
 type HealthState = "online" | "offline" | "checking";
-type ServiceKey = "gateway" | "weaviate" | "embedding" | "vllm";
+type ServiceKey = "gateway" | "weaviate" | "llm";
 
 type SearchResult = {
   id: string;
@@ -31,8 +31,7 @@ type Settings = {
   syntheticOverlay: boolean;
   gatewayUrl: string;
   weaviateUrl: string;
-  embeddingUrl: string;
-  vllmUrl: string;
+  llmUrl: string;
   apiKey: string;
   model: string;
 };
@@ -48,11 +47,16 @@ const defaultSettings: Settings = {
   syntheticOverlay: false,
   gatewayUrl: "http://127.0.0.1:9100",
   weaviateUrl: "http://127.0.0.1:8080",
-  embeddingUrl: "http://127.0.0.1:11434",
-  vllmUrl: "http://127.0.0.1:8000",
+  llmUrl: "http://127.0.0.1:8000",
   apiKey: "",
-  model: "qwen2.5-32b-instruct",
+  model: "gemma-4-31b-q4",
 };
+
+const settingsStorageKey = "global-rag-settings";
+const legacyGatewayUrls = new Map([
+  ["http://127.0.0.1:8090", "http://127.0.0.1:9100"],
+  ["http://localhost:8090", "http://localhost:9100"],
+]);
 
 type SkyFrame = {
   provider: string;
@@ -102,16 +106,16 @@ const demoResults: SearchResult[] = [
     tags: ["部署文档", "混合检索"],
   },
   {
-    id: "vllm-guide",
-    title: "WSL2 + vLLM 部署 Qwen2.5-32B 指南",
-    heading: "故障排查 · vLLM 启动 OOM",
+    id: "gemma-guide",
+    title: "WSL2 + llama.cpp 部署 Gemma 4 31B 指南",
+    heading: "故障排查 · Gemma Q4 服务启动",
     content:
-      "双 RTX 3090 使用 tensor parallel 2。若启动时显存不足，先将 gpu-memory-utilization 从 0.95 降到 0.85，并把 max-model-len 从 8192 调整为 4096。",
-    sourcePath: "~/docs/README_WSL2_vLLM_32B.md",
-    sourceName: "README_WSL2_vLLM_32B.md",
+      "Gemma 4 31B Q4 通过 llama.cpp server 提供 OpenAI 兼容接口。当前运行配置监听 8000，启动入口为 F:\\scripts\\Gemma\\start_q4_server_persistent_v4.bat。",
+    sourcePath: "~/docs/Gemma4-31B-Vector-RAG-Implementation-Plan-CN.md",
+    sourceName: "Gemma4-31B-Vector-RAG-Implementation-Plan-CN.md",
     score: 0.89,
     scope: "global",
-    tags: ["部署文档", "vLLM"],
+    tags: ["部署文档", "llama.cpp", "Gemma"],
   },
   {
     id: "resource-plan",
@@ -288,19 +292,30 @@ export default function Home() {
   const [answering, setAnswering] = useState(false);
   const [sessionId, setSessionId] = useState("local-main");
   const [memoryText, setMemoryText] = useState("");
-  const [health, setHealth] = useState<Record<ServiceKey, HealthState>>({ gateway: "online", weaviate: "online", embedding: "online", vllm: "online" });
+  const [health, setHealth] = useState<Record<ServiceKey, HealthState>>({ gateway: "online", weaviate: "online", llm: "online" });
   const [lastCheck, setLastCheck] = useState("刚刚");
 
   useEffect(() => {
-    const saved = localStorage.getItem("global-rag-settings");
+    const saved = localStorage.getItem(settingsStorageKey);
     if (!saved) return;
 
     let restored: Settings;
-    try { restored = { ...defaultSettings, ...JSON.parse(saved) }; }
+    let migrated = false;
+    try {
+      const parsed = JSON.parse(saved) as Partial<Settings> & { vllmUrl?: string; embeddingUrl?: string };
+      const legacyGatewayUrl = typeof parsed.gatewayUrl === "string" ? legacyGatewayUrls.get(parsed.gatewayUrl) : undefined;
+      const legacyLlmUrl = typeof parsed.vllmUrl === "string" ? parsed.vllmUrl : undefined;
+      restored = { ...defaultSettings, ...parsed, ...(legacyGatewayUrl ? { gatewayUrl: legacyGatewayUrl } : {}), ...(legacyLlmUrl ? { llmUrl: legacyLlmUrl } : {}) };
+      migrated = Boolean(legacyGatewayUrl || legacyLlmUrl || parsed.embeddingUrl);
+    }
     catch { return; }
 
     let cancelled = false;
-    queueMicrotask(() => { if (!cancelled) setSettings(restored); });
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setSettings(restored);
+      if (migrated) localStorage.setItem(settingsStorageKey, JSON.stringify(restored));
+    });
     return () => { cancelled = true; };
   }, []);
 
@@ -329,7 +344,7 @@ export default function Home() {
 
   function saveSettings(next: Settings) {
     setSettings(next);
-    localStorage.setItem("global-rag-settings", JSON.stringify(next));
+    localStorage.setItem(settingsStorageKey, JSON.stringify(next));
   }
 
   function flash(message: string) {
@@ -369,18 +384,17 @@ export default function Home() {
   }
 
   async function checkHealth() {
-    setHealth({ gateway: "checking", weaviate: "checking", embedding: "checking", vllm: "checking" });
+    setHealth({ gateway: "checking", weaviate: "checking", llm: "checking" });
     if (settings.demoMode) {
       await new Promise((resolve) => window.setTimeout(resolve, 520));
-      setHealth({ gateway: "online", weaviate: "online", embedding: "online", vllm: "online" });
+      setHealth({ gateway: "online", weaviate: "online", llm: "online" });
       setLastCheck("刚刚");
       return;
     }
     const checks: [ServiceKey, string, Record<string, string>?][] = [
       ["gateway", `${settings.gatewayUrl}/health`],
       ["weaviate", `${settings.weaviateUrl}/v1/.well-known/ready`, settings.apiKey ? { Authorization: `Bearer ${settings.apiKey}` } : undefined],
-      ["embedding", `${settings.embeddingUrl}/api/tags`],
-      ["vllm", `${settings.vllmUrl}/health`],
+      ["llm", `${settings.llmUrl}/health`],
     ];
     const states = await Promise.all(checks.map(async ([key, url, headers]) => {
       try { const response = await fetch(url, { headers }); return [key, response.ok ? "online" : "offline"] as const; }
@@ -402,13 +416,13 @@ export default function Home() {
     try {
       if (settings.demoMode) {
         await new Promise((resolve) => window.setTimeout(resolve, 780));
-        setAnswer("部署时应先保证 Weaviate、CPU Embedding 和 vLLM 三类服务彼此隔离：两张 RTX 3090 留给 Qwen2.5-32B，检索向量化走 CPU。一般中文查询可从 0.55–0.65 的语义权重开始；遇到错误码、文件名或命令时降低语义权重。若 vLLM 启动显存不足，优先将显存利用率降至 0.85，并把最大上下文调整为 4096。数据库与模型文件都应放在 WSL2 ext4 中。［1］［2］［3］");
+        setAnswer("部署时由 RAG Gateway 统一编排 Weaviate、进程内 BGE-M3 与 llama.cpp Gemma：BGE-M3 只负责向量化，Gemma 负责问题分类、检索规划与带依据回答。当前 Gemma Q4 服务默认监听 8000；浏览器最终只访问 Gateway 9100，模型密钥和检索细节不下发前端。数据库与模型文件应放在 WSL2 ext4 中。［1］［2］［3］");
       } else {
         const messages = [
           { role: "system", content: "你是本地知识库助手。只根据给出的检索片段回答，使用［序号］标注依据。" },
           { role: "user", content: `问题：${query}\n\n检索片段：\n${context.map((item, i) => `［${i + 1}］${item.title} / ${item.heading}\n${item.content}`).join("\n\n")}` },
         ];
-        const response = await fetch(`${settings.vllmUrl.replace(/\/$/, "")}/v1/chat/completions`, {
+        const response = await fetch(`${settings.llmUrl.replace(/\/$/, "")}/v1/chat/completions`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ model: settings.model, messages, temperature: 0.2, max_tokens: 900 }),
@@ -470,7 +484,7 @@ export default function Home() {
         <header className="topbar">
           <div className="mobile-brand"><span className="brand-seal">检</span><b>归藏</b></div>
           <div className="service-strip">
-            {([ ["weaviate", "Weaviate", "1.38"], ["embedding", "Embedding", "BGE-M3"], ["vllm", "vLLM", "32B"] ] as [ServiceKey, string, string][]).map(([key, label, meta]) => (
+            {([ ["weaviate", "Weaviate", "1.38"], ["gateway", "BGE-M3", "内置"], ["llm", "Gemma", "31B Q4"] ] as [ServiceKey, string, string][]).map(([key, label, meta]) => (
               <button key={key} onClick={() => setView("status")} className="service-pill" title={`查看 ${label} 服务状态`}>
                 <span className={`status-dot ${health[key]}`}/><span>{label}</span><small>{meta}</small>
               </button>
@@ -537,7 +551,7 @@ export default function Home() {
 
               <div className="answer-panel">
                 <div className="answer-head"><div><span className="section-kicker">SYNTHESIS</span><h2>依据整理</h2></div><button onClick={generateAnswer} disabled={answering || !results.length} className="outline-button"><Icon name="spark"/>{answering ? "正在生成" : "整理为回答"}</button></div>
-                {answer ? <p className="answer-text">{answer}</p> : <p className="empty-answer">选择引用片段后，可由本地 vLLM 整理为带出处的回答；不选择时默认使用前三条结果。</p>}
+                {answer ? <p className="answer-text">{answer}</p> : <p className="empty-answer">选择引用片段后，可由本地 llama.cpp Gemma 整理为带出处的回答；不选择时默认使用前三条结果。下一版将由 Gateway 统一完成问题分类、检索与生成。</p>}
               </div>
             </section>
 
@@ -573,7 +587,7 @@ export default function Home() {
                 <div className="memory-actions"><select aria-label="记忆类型"><option>decision · 决策</option><option>fact · 事实</option><option>summary · 摘要</option></select><button disabled={!memoryText.trim()} className="primary-button compact" onClick={() => { postGateway("/v1/memory", { content: memoryText, session_id: sessionId, memory_type: "decision", importance: .8, scope: "private" }, "已写入会话记忆"); setMemoryText(""); }}><Icon name="plus"/>保存记忆</button></div>
               </section>
               <section className="memory-list-panel"><div className="memory-list-head"><span className="section-kicker">RECENT MEMORY</span><h2>近期记忆</h2></div>
-                {[ ["决策", "检索服务不得占用两张 RTX 3090，Embedding 固定走 CPU。", "今天 18:44"], ["事实", "Qwen2.5-32B 通过 vLLM 以 tensor-parallel-size=2 启动。", "今天 18:39"], ["摘要", "本轮完成 Weaviate、BGE-M3 与 Gateway 的部署参数确认。", "今天 18:33"] ].map(([type, text, time], i) => <article className="memory-card" key={text}><span>{type}</span><p>{text}</p><footer><i>重要度 {(.9 - i * .1).toFixed(1)}</i><time>{time}</time></footer></article>)}
+                {[ ["决策", "BGE-M3 内置于 Gateway，只负责查询与文档向量。", "今天 18:44"], ["事实", "Gemma 4 31B Q4 通过 llama.cpp server 提供本地模型接口。", "今天 18:39"], ["摘要", "下一版由 Gateway 统一完成分类、检索编排与带依据回答。", "今天 18:33"] ].map(([type, text, time], i) => <article className="memory-card" key={text}><span>{type}</span><p>{text}</p><footer><i>重要度 {(.9 - i * .1).toFixed(1)}</i><time>{time}</time></footer></article>)}
               </section>
             </div>
           </div>
@@ -583,7 +597,7 @@ export default function Home() {
           <div className="page inner-page">
             <div className="title-row"><PageTitle kicker="SYSTEM PULSE" title="服务状态" description={`上次检查：${lastCheck}。状态检测只读取健康端点，不修改服务。`}/><button className="outline-button" onClick={checkHealth}><Icon name="pulse"/>重新检查</button></div>
             <div className="status-grid">
-              {([ ["gateway", "RAG Gateway", settings.gatewayUrl, "检索、入库与权限封装", "12 ms"], ["weaviate", "Weaviate", settings.weaviateUrl, "BM25 + HNSW 混合索引", "18 ms"], ["embedding", "BGE-M3", settings.embeddingUrl, "1024 维 · CPU 推理", "106 ms"], ["vllm", "Qwen2.5-32B", settings.vllmUrl, "双 3090 · GPTQ INT4", "24 tok/s"] ] as [ServiceKey, string, string, string, string][]).map(([key, title, url, description, metric], i) => <article className="status-card" key={key}><div className="status-card-top"><span className="ordinal">{["壹", "贰", "叁", "肆"][i]}</span><span className={`large-status ${health[key]}`}>{health[key] === "checking" ? "检查中" : health[key] === "online" ? "运行正常" : "无法连接"}</span></div><h2>{title}</h2><p>{description}</p><code>{url}</code><footer><span>当前指标</span><b>{health[key] === "online" ? metric : "—"}</b></footer></article>)}
+              {([ ["gateway", "RAG Gateway + BGE-M3", settings.gatewayUrl, "检索编排、入库、权限与进程内向量化", "9100"], ["weaviate", "Weaviate", settings.weaviateUrl, "BM25 + HNSW 混合索引", "8080"], ["llm", "Gemma 4 31B Q4", settings.llmUrl, "llama.cpp · 问答与问题分类器", "8000"] ] as [ServiceKey, string, string, string, string][]).map(([key, title, url, description, metric], i) => <article className="status-card" key={key}><div className="status-card-top"><span className="ordinal">{["壹", "贰", "叁"][i]}</span><span className={`large-status ${health[key]}`}>{health[key] === "checking" ? "检查中" : health[key] === "online" ? "运行正常" : "无法连接"}</span></div><h2>{title}</h2><p>{description}</p><code>{url}</code><footer><span>当前端口</span><b>{health[key] === "online" ? metric : "—"}</b></footer></article>)}
             </div>
             <section className="paper-panel resource-panel"><PanelHeading number="监" title="资源边界" text="按部署文档设定的本机资源上限。"/><div className="resource-bars"><ResourceBar label="Weaviate 内存" value="8.7 / 14 GB" width="62%"/><ResourceBar label="Embedding 内存" value="3.2 / 6 GB" width="53%"/><ResourceBar label="向量容量" value="0.34 / 0.8 M" width="42%"/></div></section>
           </div>
@@ -597,10 +611,9 @@ export default function Home() {
               <div className="settings-grid">
                 <label className="field"><span>RAG Gateway</span><input value={settings.gatewayUrl} onChange={(e) => setSettings({ ...settings, gatewayUrl: e.target.value })}/></label>
                 <label className="field"><span>Weaviate</span><input value={settings.weaviateUrl} onChange={(e) => setSettings({ ...settings, weaviateUrl: e.target.value })}/></label>
-                <label className="field"><span>Embedding / Ollama</span><input value={settings.embeddingUrl} onChange={(e) => setSettings({ ...settings, embeddingUrl: e.target.value })}/></label>
-                <label className="field"><span>vLLM OpenAI API</span><input value={settings.vllmUrl} onChange={(e) => setSettings({ ...settings, vllmUrl: e.target.value })}/></label>
+                <label className="field"><span>llama.cpp Gemma API</span><input value={settings.llmUrl} onChange={(e) => setSettings({ ...settings, llmUrl: e.target.value })}/></label>
                 <label className="field"><span>Weaviate / Gateway API Key</span><input type="password" value={settings.apiKey} placeholder="至少 32 字节" onChange={(e) => setSettings({ ...settings, apiKey: e.target.value })}/></label>
-                <label className="field"><span>vLLM 模型名称</span><input value={settings.model} onChange={(e) => setSettings({ ...settings, model: e.target.value })}/></label>
+                <label className="field"><span>Gemma 模型别名</span><input value={settings.model} onChange={(e) => setSettings({ ...settings, model: e.target.value })}/></label>
               </div>
               <section className="space-settings">
                 <div className="space-settings-head"><div><span className="section-kicker">DEEP SPACE DISPLAY</span><h2>深空显示参数</h2></div><span>实时预览</span></div>

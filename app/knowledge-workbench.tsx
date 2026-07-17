@@ -43,7 +43,7 @@ const trees: Record<LibraryId, TreeNode[]> = {
   ],
   production: [
     { id: "pr-unclassified", label: "未归类", count: 8, hint: "需确认环境" },
-    { id: "pr-platform", label: "平台与基础设施", count: 312, children: [{ id: "pr-wsl", label: "WSL2", count: 86 }, { id: "pr-vllm", label: "vLLM", count: 74 }, { id: "pr-vector", label: "向量数据库", count: 92 }] },
+    { id: "pr-platform", label: "平台与基础设施", count: 312, children: [{ id: "pr-wsl", label: "WSL2", count: 86 }, { id: "pr-llamacpp", label: "llama.cpp / Gemma", count: 74 }, { id: "pr-vector", label: "向量数据库", count: 92 }] },
     { id: "pr-sop", label: "标准作业流程", count: 189 },
     { id: "pr-incidents", label: "故障与复盘", count: 137, children: [{ id: "pr-oom", label: "GPU / OOM", count: 39 }, { id: "pr-index", label: "索引异常", count: 27 }] },
     { id: "pr-archive", label: "历史版本", count: 73 },
