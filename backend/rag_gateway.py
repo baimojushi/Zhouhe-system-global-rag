@@ -427,7 +427,7 @@ class LLMConfigRequest(BaseModel):
 @app.post("/v1/llm/config")
 async def configure_llm(request: LLMConfigRequest):
     """Update LLM API configuration at runtime (from settings page)."""
-    from . import llm_adapter
+    import llm_adapter
     llm_adapter.update_config(base=request.llm_api_base, key=request.llm_api_key, model=request.llm_model)
     log.info(f"LLM config updated: base={request.llm_api_base[:30]}... model={request.llm_model}")
     return {"status": "ok", **llm_adapter.get_config()}
@@ -435,13 +435,13 @@ async def configure_llm(request: LLMConfigRequest):
 @app.get("/v1/llm/config")
 async def get_llm_config():
     """Get current LLM API configuration."""
-    from . import llm_adapter
+    import llm_adapter
     return llm_adapter.get_config()
 
 @app.get("/v1/llm/test")
 async def test_llm_connectivity():
     """Test LLM API connectivity."""
-    from . import llm_adapter
+    import llm_adapter
     result = await llm_adapter.test_connectivity()
     log.info(f"LLM connectivity test: ok={result.get('ok')}")
     return result
@@ -553,8 +553,8 @@ def _ensure_taxonomy_collection() -> Optional[object]:
                     wvc.config.Property(name="name", data_type=wvc.config.DataType.TEXT),
                     wvc.config.Property(name="description", data_type=wvc.config.DataType.TEXT),
                     wvc.config.Property(name="is_unclassified", data_type=wvc.config.DataType.BOOL),
-                    wvc.config.Property(name="version_created", data_type=wvc.config.DataType.INT64),
-                    wvc.config.Property(name="version_retired", data_type=wvc.config.DataType.INT64, additional_properties=["nullable"], is_nullable=True),
+                    wvc.config.Property(name="version_created", data_type=wvc.config.DataType.INT),
+                    wvc.config.Property(name="version_retired", data_type=wvc.config.DataType.INT, is_nullable=True),
                 ],
             )
             log.info("taxonomy_nodes collection created")
@@ -580,7 +580,7 @@ def _seed_taxonomy_nodes(coll: Optional[object]):
         for node in nodes:
             node["version_created"] = version
             node["version_retired"] = None
-        coll.data.insert_batch(nodes)
+        coll.data.insert_many(nodes)
         log.info(f"Seeded {len(nodes)} taxonomy nodes for {library_id}")
 
 
@@ -797,7 +797,7 @@ async def create_taxonomy_proposal(request: TaxonomyProposalRequest):
         subtree_json = json.dumps(subtree, ensure_ascii=False, indent=2)
 
         # --- Step 4: Build prompt for LLM ---
-        from .llm_adapter import call_llm_for_classification  # Lazy import
+        from llm_adapter import call_llm_for_classification  # Lazy import
         proposal_id = f"proposal-{request.library_id}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
         change_set = {
             "change_set_id": proposal_id,
@@ -982,13 +982,14 @@ async def discover_associations(request: KnowledgeEdgeRequest):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="RAG Gateway")
     parser.add_argument("--port", type=int, default=9100, help="Gateway port")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Bind address (use 0.0.0.0 for WSL external access)")
     args = parser.parse_args()
 
     import uvicorn
-    log.info(f"Starting RAG Gateway on 127.0.0.1:{args.port}")
+    log.info(f"Starting RAG Gateway on {args.host}:{args.port}")
     uvicorn.run(
         "rag_gateway:app",
-        host="127.0.0.1",
+        host=args.host,
         port=args.port,
         log_level="info",
     )
