@@ -71,6 +71,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .eyebrow { display: flex; align-items: center; gap: 10px; font: 10px/1 var(--mono); letter-spacing: .16em; color: var(--ink-faint); text-transform: uppercase; }
 .eyebrow > span { width: 24px; height: 1px; background: var(--vermilion); }
 .search-column > h1 { margin: 22px 0 16px; font-family: var(--serif); font-weight: 700; font-size: clamp(40px, 4.2vw, 66px); line-height: 1.19; letter-spacing: .03em; }
+.hero-quote-container { margin: 22px 0 16px; max-width: 100%; overflow: hidden; }
+.hero-quote { font-family: var(--serif); font-weight: 700; line-height: 1.3; letter-spacing: .03em; margin: 0; font-size: clamp(28px, 3.5vw, 56px); }
+.hero-source { color: var(--ink-faint); font-size: 12px; margin: 8px 0 0; font-family: var(--mono); }
 .search-column > h1 em { color: var(--vermilion); font-style: normal; }
 .intro { color: var(--ink-soft); line-height: 1.9; font-size: 14px; max-width: 580px; }
 .search-form { margin-top: 40px; }

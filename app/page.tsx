@@ -4,19 +4,17 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { KnowledgeWorkbench } from "./knowledge-workbench";
 
 // Classical phrases containing 宙合, from real historical texts
-const classicalPhrases = [
-  "宙合百家",     // 恽敬《伊公祠堂碑铭》: "圣贯天地，宙合百家"
-  "纵横宙合",     // 康有为《出都留别诸公》: "纵横宙合雾千重"
-  "宙合大矣",     // 平步青《霞外捃屑》: "宙合大矣"
-  "充宙合",       // 晚清: "充宙合"
-  "举凡宙合之事理", // 晚清: "举凡宙合之事理"
-  "合络天地",     // 《管子·宙合》: "合络天地，以为一裹"
-  "大之无外",     // 《管子·宙合》: "大之无外，小之无内"
-  "小之无内",     // 《管子·宙合》: "大之无外，小之无内"
-  "以为一裹",     // 《管子·宙合》: "合络天地，以为一裹"
+const classicalPhrases: { text: string; source: string }[] = [
+  { text: "圣贯天地，宙合百家，虫人万千，内外精粗", source: "恽敬《伊公祠堂碑铭》" },
+  { text: "怀抱芳馨兰一握，纵横宙合雾千重", source: "康有为《出都留别诸公》" },
+  { text: "宙合大矣，四部书未经目者，如恒河沙数", source: "平步青《霞外捃屑》" },
+  { text: "充宙合之事理，而条贯之", source: "晚清文" },
+  { text: "举凡宙合之事理，皆可推而行之", source: "晚清文" },
+  { text: "合络天地，以为一裹", source: "《管子·宙合》" },
+  { text: "大之无外，小之无内", source: "《管子·宙合》" },
 ];
 
-function randomPhrase(): string {
+function randomPhrase(): { text: string; source: string } {
   return classicalPhrases[Math.floor(Math.random() * classicalPhrases.length)];
 }
 
@@ -609,7 +607,10 @@ export default function Home() {
           <div className="page search-page">
             <section className="search-column">
               <div className="eyebrow"><span/>宙合 · GLOBAL RETRIEVAL</div>
-              <h1>「{heroPhrase}」</h1>
+              <div className="hero-quote-container">
+                <h1 className="hero-quote">「{heroPhrase.text}」</h1>
+                <p className="hero-source">—— {heroPhrase.source}</p>
+              </div>
               <p className="intro">个人终生知识库</p>
 
               <form onSubmit={runSearch} className="search-form">
