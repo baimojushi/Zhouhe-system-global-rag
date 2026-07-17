@@ -139,7 +139,7 @@ const navItems: { id: View; label: string; sub: string; icon: IconName }[] = [
   { id: "settings", label: "设置", sub: "端点与模型", icon: "settings" },
 ];
 
-type IconName = "search" | "book" | "message" | "pulse" | "settings" | "quote" | "path" | "plus" | "trash" | "check" | "arrow" | "spark" | "copy" | "sun" | "moon";
+type IconName = "search" | "book" | "message" | "pulse" | "settings" | "quote" | "path" | "plus" | "trash" | "check" | "arrow" | "spark" | "copy" | "sun" | "moon" | "restart";
 
 function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
   const paths: Record<IconName, React.ReactNode> = {
@@ -158,6 +158,7 @@ function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
     copy: <><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></>,
     sun: <><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/></>,
     moon: <path d="M20.4 15.5A8.3 8.3 0 0 1 8.5 3.6a8.4 8.4 0 1 0 11.9 11.9Z"/>,
+    restart: <><path d="M21 12a9 9 0 0 0-9-9 9.8 9.8 0 0 0-6.6 2.6L3 7"/><path d="M3 7v6h6"/><path d="M3 13a9 9 0 0 0 9 9 9.8 9.8 0 0 0 6.6-2.6L21 17"/><path d="M21 17v-6h-6"/></>,
   };
   return <svg aria-hidden="true" viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }
@@ -294,6 +295,7 @@ export default function Home() {
   const [memoryText, setMemoryText] = useState("");
   const [health, setHealth] = useState<Record<ServiceKey, HealthState>>({ gateway: "online", weaviate: "online", llm: "online" });
   const [lastCheck, setLastCheck] = useState("刚刚");
+  const [restarting, setRestarting] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     const saved = localStorage.getItem(settingsStorageKey);
@@ -404,6 +406,40 @@ export default function Home() {
     setLastCheck(new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }));
   }
 
+  async function handleRestart(service: "gateway" | "weaviate" | "llm" | "all", profile?: "q4" | "q8") {
+    const key = service === "llm" ? "gemma" : service;
+    setRestarting((prev) => new Set(prev).add(key));
+    try {
+      const response = await fetch("/api/services/restart", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ service: key, profile }),
+      });
+      const data = await response.json() as { ok?: boolean; message?: string; error?: string };
+      if (!response.ok || !data.ok) {
+        flash(data.error || data.message || "重启失败");
+      } else {
+        flash(data.message || `${service === "llm" ? "Gemma" : service === "all" ? "全部服务" : "服务"}正在重启…`);
+        // Re-check health after delay
+        await new Promise((resolve) => setTimeout(resolve, service === "all" ? 12000 : 6000));
+        await checkHealth();
+      }
+    } catch (error) {
+      flash(error instanceof Error ? error.message : "重启请求失败");
+    } finally {
+      setRestarting((prev) => {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
+    }
+  }
+
+  function restartPillLabel(service: string): string {
+    const map: Record<string, string> = { gateway: "网关", weaviate: "Weaviate", llm: "Gemma" };
+    return map[service] || service;
+  }
+
   function toggleCitation(id: string) {
     setSelected((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
     flash(selected.includes(id) ? "已移出引用" : "已加入回答上下文");
@@ -485,9 +521,19 @@ export default function Home() {
           <div className="mobile-brand"><span className="brand-seal">检</span><b>归藏</b></div>
           <div className="service-strip">
             {([ ["weaviate", "Weaviate", "1.38"], ["gateway", "BGE-M3", "内置"], ["llm", "Gemma", "31B Q4"] ] as [ServiceKey, string, string][]).map(([key, label, meta]) => (
-              <button key={key} onClick={() => setView("status")} className="service-pill" title={`查看 ${label} 服务状态`}>
-                <span className={`status-dot ${health[key]}`}/><span>{label}</span><small>{meta}</small>
-              </button>
+              <div key={key} className="service-pill-wrapper">
+                <button className="service-pill" onClick={() => setView("status")} title={`查看 ${label} 服务状态`}>
+                  <span className={`status-dot ${health[key]}`}/><span>{label}</span><small>{meta}</small>
+                </button>
+                <button
+                  className="service-restart"
+                  onClick={() => handleRestart(key, key === "llm" ? undefined : undefined)}
+                  disabled={restarting.has(key)}
+                  title={`重启 ${label} 服务`}
+                >
+                  {restarting.has(key) ? <span className="loading-mark"/> : <Icon name="restart" size={15}/>}
+                </button>
+              </div>
             ))}
           </div>
           <div className="top-actions">
@@ -595,9 +641,9 @@ export default function Home() {
 
         {view === "status" && (
           <div className="page inner-page">
-            <div className="title-row"><PageTitle kicker="SYSTEM PULSE" title="服务状态" description={`上次检查：${lastCheck}。状态检测只读取健康端点，不修改服务。`}/><button className="outline-button" onClick={checkHealth}><Icon name="pulse"/>重新检查</button></div>
+            <div className="title-row"><PageTitle kicker="SYSTEM PULSE" title="服务状态" description={`上次检查：${lastCheck}。状态检测只读取健康端点，不修改服务。`}/><div className="status-actions"><button className="outline-button" onClick={checkHealth}><Icon name="pulse"/>重新检查</button><button className="outline-button" onClick={() => handleRestart("all")} disabled={restarting.has("all")}>{restarting.has("all") ? "全部重启中…" : "重启全部服务"}</button></div></div>
             <div className="status-grid">
-              {([ ["gateway", "RAG Gateway + BGE-M3", settings.gatewayUrl, "检索编排、入库、权限与进程内向量化", "9100"], ["weaviate", "Weaviate", settings.weaviateUrl, "BM25 + HNSW 混合索引", "8080"], ["llm", "Gemma 4 31B Q4", settings.llmUrl, "llama.cpp · 问答与问题分类器", "8000"] ] as [ServiceKey, string, string, string, string][]).map(([key, title, url, description, metric], i) => <article className="status-card" key={key}><div className="status-card-top"><span className="ordinal">{["壹", "贰", "叁"][i]}</span><span className={`large-status ${health[key]}`}>{health[key] === "checking" ? "检查中" : health[key] === "online" ? "运行正常" : "无法连接"}</span></div><h2>{title}</h2><p>{description}</p><code>{url}</code><footer><span>当前端口</span><b>{health[key] === "online" ? metric : "—"}</b></footer></article>)}
+              {([ ["gateway", "RAG Gateway + BGE-M3", settings.gatewayUrl, "检索编排、入库、权限与进程内向量化", "9100"], ["weaviate", "Weaviate", settings.weaviateUrl, "BM25 + HNSW 混合索引", "8080"], ["llm", "Gemma 4 31B Q4", settings.llmUrl, "llama.cpp · 问答与问题分类器", "8000"] ] as [ServiceKey, string, string, string, string][]).map(([key, title, url, description, metric], i) => <article className="status-card" key={key}><div className="status-card-top"><span className="ordinal">{["壹", "贰", "叁"][i]}</span><span className={`large-status ${health[key]}`}>{health[key] === "checking" ? "检查中" : health[key] === "online" ? "运行正常" : "无法连接"}</span></div><h2>{title}</h2><p>{description}</p><code>{url}</code><footer><span>当前端口</span><b>{health[key] === "online" ? metric : "—"}</b></footer><div className="status-card-actions"><button className="outline-button compact-restart" onClick={() => handleRestart(key as "gateway" | "weaviate" | "llm")} disabled={restarting.has(key)}>{restarting.has(key) ? "重启中…" : "重启服务"}</button></div></article>)}
             </div>
             <section className="paper-panel resource-panel"><PanelHeading number="监" title="资源边界" text="按部署文档设定的本机资源上限。"/><div className="resource-bars"><ResourceBar label="Weaviate 内存" value="8.7 / 14 GB" width="62%"/><ResourceBar label="Embedding 内存" value="3.2 / 6 GB" width="53%"/><ResourceBar label="向量容量" value="0.34 / 0.8 M" width="42%"/></div></section>
           </div>
