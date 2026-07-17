@@ -17,9 +17,6 @@ if (!(await exists(resolve(standalone, "server.js")))) {
   process.exit(1);
 }
 
-// Copy static assets from build output into the standalone directory
-// .next/static → .next/static (required by Next.js standalone server)
-// public → public (for additional assets like sky frames)
 await cp(resolve(root, ".next/static"), resolve(standalone, ".next/static"), { recursive: true, force: true });
 await cp(resolve(root, "public"), resolve(standalone, "public"), { recursive: true, force: true });
 

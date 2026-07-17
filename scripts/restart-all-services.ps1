@@ -1,0 +1,153 @@
+﻿[CmdletBinding()]
+param(
+  [string]$Distro = "Ubuntu-22.04",
+  [string]$WslUser = "baimo",
+  [string]$LinuxRoot = "/opt/global-rag",
+  [ValidateSet("q4", "q8")]
+  [string]$GemmaProfile = "q4",
+  [int]$GemmaPort = 0,
+  [int]$GatewayPort = 9100,
+  [int]$UiPort = 3000,
+  [switch]$Build
+)
+
+$ErrorActionPreference = "Stop"
+if ($GemmaPort -eq 0) { $GemmaPort = $(if ($GemmaProfile -eq "q8") { 8002 } else { 8000 }) }
+$RepoRoot = Split-Path -Parent $PSScriptRoot
+$RuntimeDir = Join-Path $RepoRoot ".runtime"
+New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
+
+function Test-Http([string]$Url, [int]$TimeoutSeconds = 3) {
+  try {
+    $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec $TimeoutSeconds
+    return $response.StatusCode -ge 200 -and $response.StatusCode -lt 400
+  } catch { return $false }
+}
+
+function Wait-Http([string]$Name, [string]$Url, [int]$TimeoutSeconds) {
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  do {
+    if (Test-Http $Url) { Write-Host "[OK] $Name $Url" -ForegroundColor Green; return }
+    Start-Sleep -Seconds 2
+  } while ((Get-Date) -lt $deadline)
+  throw "$Name 未在 $TimeoutSeconds 秒内就绪：$Url"
+}
+
+function Wait-Tcp([string]$Name, [int]$Port, [int]$TimeoutSeconds) {
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  do {
+    $client = [System.Net.Sockets.TcpClient]::new()
+    try {
+      $task = $client.ConnectAsync("127.0.0.1", $Port)
+      if ($task.Wait(1500) -and $client.Connected) {
+        Write-Host "[OK] $Name 127.0.0.1:$Port" -ForegroundColor Green
+        return
+      }
+    } catch { } finally { $client.Dispose() }
+    Start-Sleep -Seconds 2
+  } while ((Get-Date) -lt $deadline)
+  throw "$Name 端口 $Port 未在 $TimeoutSeconds 秒内就绪"
+}
+
+function Invoke-Wsl([string]$Command) {
+  & wsl.exe -d $Distro -u $WslUser --exec /bin/bash -lc $Command
+  if ($LASTEXITCODE -ne 0) { throw "WSL 命令失败（$LASTEXITCODE）：$Command" }
+}
+
+function Wait-Wsl([string]$Name, [string]$Command, [int]$TimeoutSeconds) {
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  do {
+    & wsl.exe -d $Distro -u $WslUser --exec /bin/bash -lc $Command *> $null
+    if ($LASTEXITCODE -eq 0) { Write-Host "[OK] $Name" -ForegroundColor Green; return }
+    Start-Sleep -Seconds 2
+  } while ((Get-Date) -lt $deadline)
+  throw "$Name 未在 $TimeoutSeconds 秒内就绪"
+}
+
+Write-Host "[1/5] 启动 Weaviate..." -ForegroundColor Cyan
+$stackRoot = "$LinuxRoot/stack"
+Invoke-Wsl "cd '$stackRoot' && docker compose up -d weaviate"
+# Use wsl to source .env and run curl, avoiding PS escaping issues
+$weaviateCheck = "cd '$stackRoot'; set -a; . ./.env; set +a; curl -fsS -m 3 -H " + "`"Authorization: Bearer $WEAVIATE_API_KEY`" http://127.0.0.1:8080/v1/.well-known/ready"
+Wait-Wsl "Weaviate :8080 / :50051" $weaviateCheck 90
+Wait-Tcp "Weaviate gRPC" 50051 30
+Wait-Tcp "Weaviate metrics" 2112 30
+
+Write-Host "[2/5] 重启 llama.cpp Gemma $($GemmaProfile.ToUpper())..." -ForegroundColor Cyan
+$gemmaManager = Join-Path $PSScriptRoot "gemma\manage-gemma.ps1"
+& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $gemmaManager -Action restart -Profile $GemmaProfile -Distro $Distro -WslUser $WslUser
+if ($LASTEXITCODE -ne 0) { throw "Gemma $GemmaProfile 启动失败" }
+Wait-Http "Gemma" "http://127.0.0.1:$GemmaPort/health" 480
+
+Write-Host "[3/5] 重启 RAG Gateway（内置 BGE-M3）..." -ForegroundColor Cyan
+# Write gateway start script to temp file in WSL to avoid PS string escaping issues
+$gatewayStartScript = @'
+mkdir -p /opt/global-rag/run /opt/global-rag/logs
+if [ -s /opt/global-rag/run/gateway.pid ]; then
+  oldpid=$(cat /opt/global-rag/run/gateway.pid)
+  if [ -r /proc/$oldpid/cmdline ] && tr '\0' ' ' < /proc/$oldpid/cmdline | grep -q rag_gateway.py; then
+    kill $oldpid 2>/dev/null || true
+  fi
+fi
+pkill -TERM -f '[r]ag_gateway.py' 2>/dev/null || true
+sleep 2
+cd /opt/global-rag
+nohup /opt/global-rag/venv/bin/python3 /opt/global-rag/rag_gateway.py --port 9100 >> /opt/global-rag/logs/gateway.log 2>&1 &
+echo $! > /opt/global-rag/run/gateway.pid
+'@
+# Build temp script path with PS timestamp to avoid collisions
+$ts = Get-Date -Format "yyyyMMddHHmmss"
+$tmpGatewayScript = "/tmp/rag-start-gateway-${ts}.sh"
+# Pipe script to wsl bash via stdin (PS 5.1 doesn't support <<<)
+$gatewayStartScript | & wsl.exe -d $Distro -u $WslUser bash -c "cat > '$tmpGatewayScript' && chmod +x '$tmpGatewayScript' && bash '$tmpGatewayScript' && rm '$tmpGatewayScript'"
+Wait-Http "RAG Gateway" "http://127.0.0.1:$GatewayPort/health" 240
+
+Write-Host "[4/5] 重启 Web GUI..." -ForegroundColor Cyan
+$uiPidFile = Join-Path $RuntimeDir "ui.pid"
+if (Test-Path $uiPidFile) {
+  $oldUiPid = [int](Get-Content $uiPidFile -Raw)
+  $ownedProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $oldUiPid" -ErrorAction SilentlyContinue
+  if ($ownedProcess -and $ownedProcess.CommandLine -match "start-local\.mjs") {
+    Stop-Process -Id $oldUiPid -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 1
+  }
+  Remove-Item $uiPidFile -Force -ErrorAction SilentlyContinue
+}
+
+$listeners = Get-NetTCPConnection -LocalPort $UiPort -State Listen -ErrorAction SilentlyContinue
+foreach ($listener in $listeners) {
+  $listenerProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $($listener.OwningProcess)" -ErrorAction SilentlyContinue
+  if ($listenerProcess -and ($listenerProcess.CommandLine -match "start-local\.mjs" -or $listenerProcess.CommandLine -like "*$RepoRoot*")) {
+    Stop-Process -Id $listener.OwningProcess -Force -ErrorAction SilentlyContinue
+  } else {
+    throw "端口 $UiPort 已被非本项目进程占用（PID $($listener.OwningProcess)），为避免误杀已停止。"
+  }
+}
+
+Push-Location $RepoRoot
+try {
+  $standaloneServer = Join-Path ".next" "standalone/server.js"
+  if ($Build -or -not (Test-Path $standaloneServer)) {
+    & npm.cmd run build
+    if ($LASTEXITCODE -ne 0) { throw "Web GUI 构建失败" }
+  }
+  $stdout = Join-Path $RuntimeDir "ui.stdout.log"
+  $stderr = Join-Path $RuntimeDir "ui.stderr.log"
+  $ui = Start-Process -FilePath "node.exe" -ArgumentList "scripts/start-local.mjs" -WorkingDirectory $RepoRoot -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+  Set-Content -Path $uiPidFile -Value $ui.Id -Encoding ascii
+} finally { Pop-Location }
+Wait-Http "Web GUI" "http://127.0.0.1:$UiPort" 90
+
+Write-Host "[5/5] 验证前端静态资源..." -ForegroundColor Cyan
+Push-Location $RepoRoot
+try {
+  & npm.cmd run verify:ui
+  if ($LASTEXITCODE -ne 0) { throw "前端 JS/CSS 静态资源验证失败" }
+} finally { Pop-Location }
+
+Write-Host ""
+Write-Host "全部服务已就绪" -ForegroundColor Green
+Write-Host "  GUI       http://127.0.0.1:$UiPort"
+Write-Host "  Gateway   http://127.0.0.1:$GatewayPort/health"
+Write-Host "  Gemma     http://127.0.0.1:$GemmaPort/health"
+Write-Host "  Weaviate  http://127.0.0.1:8080/v1/.well-known/ready"

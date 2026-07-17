@@ -18,8 +18,11 @@ try {
 
   const stylesheets = [...html.matchAll(/<link[^>]+rel="stylesheet"[^>]+href="([^"]+)"/g)]
     .map((match) => match[1]);
+  const scripts = [...html.matchAll(/<script[^>]+src="([^"]+)"/g)]
+    .map((match) => match[1]);
 
   if (!stylesheets.length) fail("主页没有加载任何样式表");
+  if (!scripts.length) fail("主页没有加载任何客户端脚本，页面无法交互");
 
   const cssResponses = await Promise.all(
     stylesheets.map(async (href) => {
@@ -31,6 +34,28 @@ try {
 
   const unavailable = cssResponses.find(({ response }) => !response.ok);
   if (unavailable) fail(`样式资源 ${unavailable.href} 返回 HTTP ${unavailable.response.status}`);
+
+  const scriptResponses = await Promise.all(
+    scripts.map(async (src) => {
+      const url = new URL(src, `${baseUrl}/`);
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(6000),
+        headers: { "Cache-Control": "no-cache" },
+      });
+      return { src, response };
+    }),
+  );
+
+  const unavailableScript = scriptResponses.find(({ response }) => !response.ok);
+  if (unavailableScript) fail(`客户端脚本 ${unavailableScript.src} 返回 HTTP ${unavailableScript.response.status}`);
+
+  const invalidScript = scriptResponses.find(({ response }) => {
+    const contentType = response.headers.get("content-type") ?? "";
+    return !/(?:java|ecma)script/.test(contentType);
+  });
+  if (invalidScript) {
+    fail(`客户端脚本 ${invalidScript.src} 的媒体类型异常：${invalidScript.response.headers.get("content-type") ?? "缺失"}`);
+  }
 
   if (!cssResponses.some(({ css }) => css.includes(".app-shell"))) {
     fail("样式表可访问，但缺少产品界面的核心样式");
@@ -56,7 +81,7 @@ try {
   const skyBytes = Number(skyResponse.headers.get("content-length") ?? 0);
   if (skyBytes && skyBytes < 100_000) fail("夜空背景文件异常小，可能是错误页面");
 
-  console.log(`[UI 自检通过] 主页、${stylesheets.length} 个样式资源、知识库工作台与 ESO ALPACA 夜空背景均正常`);
+  console.log(`[UI 自检通过] 主页、${stylesheets.length} 个样式资源、${scripts.length} 个客户端脚本、知识库工作台与 ESO ALPACA 夜空背景均正常`);
 } catch (error) {
   fail(error instanceof Error ? error.message : "无法连接界面服务");
 }
