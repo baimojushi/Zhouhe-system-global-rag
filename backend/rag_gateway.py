@@ -34,6 +34,7 @@ os.environ.setdefault("HF_HOME", "/opt/global-rag/cache/huggingface")
 os.environ.setdefault("DOCLING_ARTIFACTS_PATH", "/opt/global-rag/cache/docling-models")
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import weaviate
 import weaviate.classes as wvc
@@ -213,6 +214,15 @@ def bm25_search(query: str, top_k: int = 5, scope: str = "global",
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="RAG Gateway", version="3.0.0")
+
+# CORS: Allow frontend (port 3000) to access Gateway (port 9100)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://127.0.0.1:3000", "http://localhost:3000", "http://0.0.0.0:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/health")
 async def health():
