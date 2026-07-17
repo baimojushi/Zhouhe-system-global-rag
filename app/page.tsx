@@ -530,7 +530,7 @@ export default function Home() {
       <aside className="sidebar">
         <div className="brand" aria-label="全局 RAG 检索工作台">
           <span className="brand-seal">检</span>
-          <span className="brand-copy"><b>归藏</b><small>RAG CONSOLE</small></span>
+          <span className="brand-copy"><b>宙合</b><small>RAG CONSOLE</small></span>
         </div>
         <nav aria-label="主导航">
           {navItems.map((item) => (
@@ -548,7 +548,7 @@ export default function Home() {
 
       <section className="workspace">
         <header className="topbar">
-          <div className="mobile-brand"><span className="brand-seal">检</span><b>归藏</b></div>
+          <div className="mobile-brand"><span className="brand-seal">检</span><b>宙合</b></div>
           <div className="service-strip">
             {([ ["weaviate", "Weaviate", "1.38"], ["gateway", "BGE-M3", "内置"], ["llm", "Gemma", "31B Q4"] ] as [ServiceKey, string, string][]).map(([key, label, meta]) => (
               <div key={key} className="service-pill-wrapper">
