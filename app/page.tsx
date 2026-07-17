@@ -610,7 +610,7 @@ export default function Home() {
           <div className="page search-page">
             <section className="search-column">
               <div className="eyebrow"><span/>宙合 · GLOBAL RETRIEVAL</div>
-              <h1>宙合 · {heroPhrase}，<br/><em>找到可信依据。</em></h1>
+              <h1>「{heroPhrase}」</h1>
               <p className="intro">混合召回文件知识与历史上下文，保留每一条答案的来源、章节和路径。</p>
 
               <form onSubmit={runSearch} className="search-form">
