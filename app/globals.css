@@ -104,7 +104,7 @@ input[type="range"]::-webkit-slider-thumb { appearance: none; width: 20px; heigh
 .section-kicker { font: 9px/1 var(--mono); color: var(--vermilion); letter-spacing: .15em; }
 .answer-head h2, .results-head h2, .memory-list-head h2 { font-family: var(--serif); margin: 7px 0 0; font-size: 24px; }
 .empty-answer { margin: 18px 0 0; color: var(--ink-faint); font-size: 12px; line-height: 1.8; }
-.answer-text { margin: 20px 0 0; font-family: var(--serif); font-size: 16px; line-height: 2; color: #293c52; white-space: pre-wrap; }
+.answer-text { margin: 20px 0 0; font-family: var(--serif); font-size: 16px; line-height: 2; color: var(--ink); white-space: pre-wrap; }
 
 .results-head { padding-bottom: 19px; border-bottom: 1px solid var(--line); }
 .result-count { display: flex; align-items: baseline; gap: 6px; }.result-count b { color: var(--vermilion); font: 34px/1 var(--serif); }.result-count span { font-size: 10px; color: var(--ink-faint); }
