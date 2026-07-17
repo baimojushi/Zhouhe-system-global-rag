@@ -30,9 +30,11 @@ function Install-Manager {
     throw "源码内缺少 $sourceScript"
   }
   Invoke-Wsl "mkdir -p '$LinuxInstallDir'"
-  Get-Content -LiteralPath $sourceScript -Raw | & wsl.exe -d $Distro -u $WslUser --exec /usr/bin/tee $linuxScript | Out-Null
-  if ($LASTEXITCODE -ne 0) { throw "复制 llama-service.sh 到 WSL 失败" }
+  # Use cat pipe instead of Get-Content | tee to avoid BOM being added to Linux script
+  cat "$PSScriptRoot\llama-service.sh" | & wsl.exe -d $Distro -u $WslUser bash -c "cat > '$linuxScript'"
   Invoke-Wsl "chmod 700 '$linuxScript'"
+  # Ensure no \r or BOM in the Linux script
+  Invoke-Wsl "sed -i '1s/^\xef\xbb\xbf//' '$linuxScript' && sed -i 's/\r\$//' '$linuxScript'"
 }
 
 function Get-Port([string]$Target) {
