@@ -3,18 +3,17 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { KnowledgeWorkbench } from "./knowledge-workbench";
 
-// Classical phrases containing 宙合, from 《管子·宙合》and related texts
+// Classical phrases containing 宙合, from real historical texts
 const classicalPhrases = [
-  "宙合之意",   // 《管子·宙合》: "宙合之意，上通于天"
-  "宙合之道",   // 宙合之道 — the way of universal union
-  "宙合以道",   // 《管子》: 以道宙合
-  "通宙合",     // 通达宙合 — connect universal union
-  "达宙合",     // 达于宙合 — reach universal union
-  "宙合之上",   // 《管子·宙合》: 宙合之上
-  "宙合之下",   // 《管子·宙合》: 宙合之下
-  "宙合不弊",   // 《管子·宙合》: 宙合而不弊
-  "宙合以成",   // 以宙合成之 — complete through universal union
-  "宙合载焉",   // 《管子》: 万物宙合载焉
+  "宙合百家",     // 恽敬《伊公祠堂碑铭》: "圣贯天地，宙合百家"
+  "纵横宙合",     // 康有为《出都留别诸公》: "纵横宙合雾千重"
+  "宙合大矣",     // 平步青《霞外捃屑》: "宙合大矣"
+  "充宙合",       // 晚清: "充宙合"
+  "举凡宙合之事理", // 晚清: "举凡宙合之事理"
+  "合络天地",     // 《管子·宙合》: "合络天地，以为一裹"
+  "大之无外",     // 《管子·宙合》: "大之无外，小之无内"
+  "小之无内",     // 《管子·宙合》: "大之无外，小之无内"
+  "以为一裹",     // 《管子·宙合》: "合络天地，以为一裹"
 ];
 
 function randomPhrase(): string {
@@ -611,7 +610,7 @@ export default function Home() {
             <section className="search-column">
               <div className="eyebrow"><span/>宙合 · GLOBAL RETRIEVAL</div>
               <h1>「{heroPhrase}」</h1>
-              <p className="intro">混合召回文件知识与历史上下文，保留每一条答案的来源、章节和路径。</p>
+              <p className="intro">个人终生知识库</p>
 
               <form onSubmit={runSearch} className="search-form">
                 <label className="query-box">
