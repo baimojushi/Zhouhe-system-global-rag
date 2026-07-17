@@ -736,9 +736,12 @@ async def create_taxonomy_proposal(request: TaxonomyProposalRequest):
 
     try:
         # --- Step 1: Find unclassified files ---
+        # The batch indexer sets scope="global" for all files.
+        # Files that haven't been moved to a library node are considered unclassified.
+        # Search for files with scope="global" (not yet classified into a library).
         coll_name = LIBRARY_REGISTRY[request.library_id]["collection"]
         kb_coll = weaviate_client.collections.get(coll_name)
-        where_filter = wvc.query.Filter.by_property("scope").equal("unclassified")
+        where_filter = wvc.query.Filter.by_property("scope").equal("global")
         query_text = f"{LIBRARY_REGISTRY[request.library_id]['name']} {request.library_id}"
         query_vec = get_model().encode(query_text).tolist()
 
@@ -935,7 +938,7 @@ async def apply_taxonomy_proposal(proposal_id: str, request: TaxonomyProposalApp
         target_scope = f"{library_id}/{op['target_node_id']}"
 
         # Find and update all matching chunks
-        where_filter = wvc.query.Filter.by_property("scope").equal("unclassified")
+        where_filter = wvc.query.Filter.by_property("scope").equal("global")
         result = kb_coll.query.hybrid(
             query="", limit=50, alpha=1.0,
             filters=where_filter, include_vector=False,
