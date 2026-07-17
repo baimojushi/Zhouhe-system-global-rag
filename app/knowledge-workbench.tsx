@@ -107,7 +107,7 @@ function confidenceColor(c: number): string {
   return "color: var(--vermilion);";
 }
 
-export function KnowledgeWorkbench({ demoMode, gatewayUrl, apiKey, onNotice }: { demoMode: boolean; gatewayUrl: string; apiKey: string; onNotice: (message: string) => void }) {
+export function KnowledgeWorkbench({ demoMode, gatewayUrl, apiKey, llmApiUrl, llmApiKey, llmModel, onNotice }: { demoMode: boolean; gatewayUrl: string; apiKey: string; llmApiUrl: string; llmApiKey: string; llmModel: string; onNotice: (message: string) => void }) {
   const [activeId, setActiveId] = useState<LibraryId>("ai-work");
   const [expanded, setExpanded] = useState<Set<string>>(new Set(["ai-projects", "ai-rag"]));
   const [selectedNode, setSelectedNode] = useState("ai-unclassified");
@@ -205,6 +205,16 @@ export function KnowledgeWorkbench({ demoMode, gatewayUrl, apiKey, onNotice }: {
     }
     setProposalState("running");
     try {
+      // Sync LLM config to backend before classification
+      if (llmApiUrl && llmApiKey) {
+        try {
+          await fetch(`${gatewayUrl.replace(/\/$/, "")}/v1/llm/config`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ llm_api_base: llmApiUrl, llm_api_key: llmApiKey, llm_model: llmModel }),
+          });
+        } catch { /* best effort */ }
+      }
       const result = await callGateway("/v1/taxonomy/proposals", {
         library_id: activeId,
         source_node: `${activeId}-unclassified`,

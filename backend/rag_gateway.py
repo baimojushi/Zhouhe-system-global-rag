@@ -416,6 +416,38 @@ async def forget_session_tool(request: ForgetSessionRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ---------------------------------------------------------------------------
+# LLM Configuration (runtime-updatable from frontend)
+# ---------------------------------------------------------------------------
+
+class LLMConfigRequest(BaseModel):
+    llm_api_base: str = Field(default="", description="OpenAI-compatible API base URL")
+    llm_api_key: str = Field(default="", description="API key")
+    llm_model: str = Field(default="", description="Model name, e.g. qwen-plus")
+
+@app.post("/v1/llm/config")
+async def configure_llm(request: LLMConfigRequest):
+    """Update LLM API configuration at runtime (from settings page)."""
+    from . import llm_adapter
+    llm_adapter.update_config(base=request.llm_api_base, key=request.llm_api_key, model=request.llm_model)
+    log.info(f"LLM config updated: base={request.llm_api_base[:30]}... model={request.llm_model}")
+    return {"status": "ok", **llm_adapter.get_config()}
+
+@app.get("/v1/llm/config")
+async def get_llm_config():
+    """Get current LLM API configuration."""
+    from . import llm_adapter
+    return llm_adapter.get_config()
+
+@app.get("/v1/llm/test")
+async def test_llm_connectivity():
+    """Test LLM API connectivity."""
+    from . import llm_adapter
+    result = await llm_adapter.test_connectivity()
+    log.info(f"LLM connectivity test: ok={result.get('ok')}")
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Taxonomy / Library Management
 # ---------------------------------------------------------------------------
 

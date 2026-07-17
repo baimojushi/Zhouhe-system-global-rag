@@ -34,6 +34,9 @@ type Settings = {
   llmUrl: string;
   apiKey: string;
   model: string;
+  llmApiUrl: string;
+  llmApiKey: string;
+  llmModel: string;
 };
 
 const defaultSettings: Settings = {
@@ -50,6 +53,9 @@ const defaultSettings: Settings = {
   llmUrl: "http://127.0.0.1:8000",
   apiKey: "",
   model: "gemma-4-31b-q4",
+  llmApiUrl: "",
+  llmApiKey: "",
+  llmModel: "qwen-plus",
 };
 
 const settingsStorageKey = "global-rag-settings";
@@ -294,6 +300,8 @@ export default function Home() {
   const [sessionId, setSessionId] = useState("local-main");
   const [memoryText, setMemoryText] = useState("");
   const [health, setHealth] = useState<Record<ServiceKey, HealthState>>({ gateway: "online", weaviate: "online", llm: "online" });
+  const [llmApiHealth, setLlmApiHealth] = useState<HealthState>("checking");
+  const [llmApiInfo, setLlmApiInfo] = useState<{ model?: string; latency_ms?: number; error?: string }>({});
   const [lastCheck, setLastCheck] = useState("刚刚");
   const [restarting, setRestarting] = useState<Set<string>>(new Set());
 
@@ -387,9 +395,11 @@ export default function Home() {
 
   async function checkHealth() {
     setHealth({ gateway: "checking", weaviate: "checking", llm: "checking" });
+    setLlmApiHealth("checking");
     if (settings.demoMode) {
       await new Promise((resolve) => window.setTimeout(resolve, 520));
       setHealth({ gateway: "online", weaviate: "online", llm: "online" });
+      setLlmApiHealth("online");
       setLastCheck("刚刚");
       return;
     }
@@ -403,6 +413,26 @@ export default function Home() {
       catch { return [key, "offline"] as const; }
     }));
     setHealth(Object.fromEntries(states) as Record<ServiceKey, HealthState>);
+    // Check LLM API connectivity
+    if (settings.llmApiUrl && settings.llmApiKey) {
+      try {
+        await fetch(`${settings.gatewayUrl.replace(/\/$/, "")}/v1/llm/config`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ llm_api_base: settings.llmApiUrl, llm_api_key: settings.llmApiKey, llm_model: settings.llmModel }),
+        });
+        const resp = await fetch(`${settings.gatewayUrl.replace(/\/$/, "")}/v1/llm/test`);
+        const result = await resp.json() as { ok?: boolean; latency_ms?: number; model?: string; error?: string; model_found?: boolean };
+        setLlmApiHealth(result.ok ? "online" : "offline");
+        setLlmApiInfo({ model: result.model, latency_ms: result.latency_ms, error: result.error });
+      } catch {
+        setLlmApiHealth("offline");
+        setLlmApiInfo({ error: "无法连接 Gateway" });
+      }
+    } else {
+      setLlmApiHealth("offline");
+      setLlmApiInfo({ error: "未配置" });
+    }
     setLastCheck(new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }));
   }
 
@@ -621,7 +651,7 @@ export default function Home() {
           </div>
         )}
 
-        {view === "library" && <KnowledgeWorkbench demoMode={settings.demoMode} gatewayUrl={settings.gatewayUrl} apiKey={settings.apiKey} onNotice={flash}/>} 
+        {view === "library" && <KnowledgeWorkbench demoMode={settings.demoMode} gatewayUrl={settings.gatewayUrl} apiKey={settings.apiKey} llmApiUrl={settings.llmApiUrl} llmApiKey={settings.llmApiKey} llmModel={settings.llmModel} onNotice={flash}/>} 
 
         {view === "memory" && (
           <div className="page inner-page">
@@ -644,6 +674,7 @@ export default function Home() {
             <div className="title-row"><PageTitle kicker="SYSTEM PULSE" title="服务状态" description={`上次检查：${lastCheck}。状态检测只读取健康端点，不修改服务。`}/><div className="status-actions"><button className="outline-button" onClick={checkHealth}><Icon name="pulse"/>重新检查</button><button className="outline-button" onClick={() => handleRestart("all")} disabled={restarting.has("all")}>{restarting.has("all") ? "全部重启中…" : "重启全部服务"}</button></div></div>
             <div className="status-grid">
               {([ ["gateway", "RAG Gateway + BGE-M3", settings.gatewayUrl, "检索编排、入库、权限与进程内向量化", "9100"], ["weaviate", "Weaviate", settings.weaviateUrl, "BM25 + HNSW 混合索引", "8080"], ["llm", "Gemma 4 31B Q4", settings.llmUrl, "llama.cpp · 问答与问题分类器", "8000"] ] as [ServiceKey, string, string, string, string][]).map(([key, title, url, description, metric], i) => <article className="status-card" key={key}><div className="status-card-top"><span className="ordinal">{["壹", "贰", "叁"][i]}</span><span className={`large-status ${health[key]}`}>{health[key] === "checking" ? "检查中" : health[key] === "online" ? "运行正常" : "无法连接"}</span></div><h2>{title}</h2><p>{description}</p><code>{url}</code><footer><span>当前端口</span><b>{health[key] === "online" ? metric : "—"}</b></footer><div className="status-card-actions"><button className="outline-button compact-restart" onClick={() => handleRestart(key as "gateway" | "weaviate" | "llm")} disabled={restarting.has(key)}>{restarting.has(key) ? "重启中…" : "重启服务"}</button></div></article>)}
+              <article className="status-card"><div className="status-card-top"><span className="ordinal">肆</span><span className={`large-status ${llmApiHealth}`}>{llmApiHealth === "checking" ? "检查中" : llmApiHealth === "online" ? "连通正常" : "未配置或无法连接"}</span></div><h2>LLM 归类 API</h2><p>OpenAI 兼容接口 · 知识库 AI 自动归类推理</p><code>{settings.llmApiUrl || "(未配置)"}</code><footer><span>{llmApiInfo.model || "模型"}</span><b>{llmApiHealth === "online" && llmApiInfo.latency_ms ? `${llmApiInfo.latency_ms}ms` : "—"}</b></footer></article>
             </div>
             <section className="paper-panel resource-panel"><PanelHeading number="监" title="资源边界" text="按部署文档设定的本机资源上限。"/><div className="resource-bars"><ResourceBar label="Weaviate 内存" value="8.7 / 14 GB" width="62%"/><ResourceBar label="Embedding 内存" value="3.2 / 6 GB" width="53%"/><ResourceBar label="向量容量" value="0.34 / 0.8 M" width="42%"/></div></section>
           </div>
@@ -662,6 +693,31 @@ export default function Home() {
                 <label className="field"><span>Gemma 模型别名</span><input value={settings.model} onChange={(e) => setSettings({ ...settings, model: e.target.value })}/></label>
               </div>
               <section className="space-settings">
+                <div className="space-settings-head"><div><span className="section-kicker">LLM API</span><h2>归类模型 API</h2></div><span>用于知识库 AI 自动归类</span></div>
+                <p>配置 OpenAI 兼容的 API 端点（如通义千问 DashScope、OpenAI 等）。URL 和 Key 仅保存在浏览器，不会写入项目源码。设置保存时自动同步到 Gateway。</p>
+                <div className="settings-grid">
+                  <label className="field"><span>API Base URL</span><input value={settings.llmApiUrl} placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1" onChange={(e) => setSettings({ ...settings, llmApiUrl: e.target.value })}/></label>
+                  <label className="field"><span>API Key</span><input type="password" value={settings.llmApiKey} placeholder="sk-..." onChange={(e) => setSettings({ ...settings, llmApiKey: e.target.value })}/></label>
+                  <label className="field"><span>Model 名称</span><input value={settings.llmModel} placeholder="qwen-plus" onChange={(e) => setSettings({ ...settings, llmModel: e.target.value })}/></label>
+                  <label className="field"><span>连通性测试</span><button className="outline-button" style={{ width: "100%", height: "46px" }} onClick={async () => {
+                    try {
+                      await fetch(`${settings.gatewayUrl.replace(/\/$/, "")}/v1/llm/config`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ llm_api_base: settings.llmApiUrl, llm_api_key: settings.llmApiKey, llm_model: settings.llmModel }),
+                      });
+                      const resp = await fetch(`${settings.gatewayUrl.replace(/\/$/, "")}/v1/llm/test`);
+                      const result = await resp.json() as { ok?: boolean; latency_ms?: number; model?: string; error?: string; model_found?: boolean };
+                      if (result.ok) {
+                        flash(`✅ LLM API 连通 · ${result.model} · ${result.latency_ms}ms${result.model_found === false ? " ⚠ 模型名未在列表中" : ""}`);
+                      } else {
+                        flash(`❌ 连接失败：${result.error || "未知错误"}`);
+                      }
+                    } catch (e) { flash(`❌ 请求失败：${e instanceof Error ? e.message : "网络错误"}`); }
+                  }}>测试 LLM 连通性</button></label>
+                </div>
+              </section>
+              <section className="space-settings">
                 <div className="space-settings-head"><div><span className="section-kicker">DEEP SPACE DISPLAY</span><h2>深空显示参数</h2></div><span>实时预览</span></div>
                 <p>背景来自 ESO 帕拉纳尔 ALPACA 实拍科学帧，每小时检查一次；当地白天或质量不足时保留最近合格夜空并明确标识。</p>
                 <div className="sky-source-card">
@@ -678,7 +734,16 @@ export default function Home() {
                   <SpaceControl label="银河曝光" value={settings.galaxyExposure} min={45} max={120} step={1} unit="%" onChange={(value) => setSettings({ ...settings, galaxyExposure: value })}/>
                 </div>
               </section>
-              <div className="settings-actions"><button className="outline-button" onClick={checkHealth}><Icon name="pulse"/>测试连接</button><button className="primary-button compact" onClick={() => { saveSettings(settings); flash("设置已保存在当前浏览器"); }}><Icon name="check"/>保存设置</button></div>
+              <div className="settings-actions"><button className="outline-button" onClick={checkHealth}><Icon name="pulse"/>测试连接</button><button className="primary-button compact" onClick={() => {
+                    saveSettings(settings);
+                    // Sync LLM config to backend
+                    fetch(`${settings.gatewayUrl.replace(/\/$/, "")}/v1/llm/config`, {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ llm_api_base: settings.llmApiUrl, llm_api_key: settings.llmApiKey, llm_model: settings.llmModel }),
+                    }).catch(() => {});
+                    flash("设置已保存并同步到 Gateway");
+                  }}><Icon name="check"/>保存设置</button></div>
               <p className="security-note">建议仅绑定 127.0.0.1，并由 Gateway 统一处理 CORS、鉴权和 scope 过滤。远程打开此界面时，浏览器可能阻止访问本机 HTTP 服务。</p>
             </section>
           </div>

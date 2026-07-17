@@ -21,6 +21,48 @@ _default_base = os.environ.get("LLM_API_BASE", "")
 _default_key = os.environ.get("LLM_API_KEY", "")
 _default_model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 
+# Runtime-configurable overrides (set via /v1/llm/config)
+_runtime_base: str = ""
+_runtime_key: str = ""
+_runtime_model: str = ""
+
+
+def _base() -> str:
+    return _runtime_base or _default_base
+
+
+def _key() -> str:
+    return _runtime_key or _default_key
+
+
+def _model() -> str:
+    return _runtime_model or _default_model
+
+
+def update_config(base: str = "", key: str = "", model: str = ""):
+    """Update LLM configuration at runtime (called from /v1/llm/config)."""
+    global _runtime_base, _runtime_key, _runtime_model
+    if base:
+        _runtime_base = base
+    if key:
+        _runtime_key = key
+    if model:
+        _runtime_model = model
+
+
+def get_config() -> dict:
+    """Return current LLM configuration (key masked)."""
+    base = _base()
+    key = _key()
+    model = _model()
+    masked_key = (key[:6] + "****" + key[-4:]) if len(key) > 10 else ("****" if key else "")
+    return {
+        "llm_api_base": base or "(未配置)",
+        "llm_api_key": masked_key or "(未配置)",
+        "llm_model": model,
+        "configured": bool(base and key),
+    }
+
 # ---------------------------------------------------------------------------
 # Prompt template
 # ---------------------------------------------------------------------------
@@ -76,18 +118,18 @@ async def call_llm_for_classification(
     """
     import aiohttp
 
-    if not _default_base or not _default_key:
-        raise ValueError("LLM_API_BASE and LLM_API_KEY must be set")
+    if not _base() or not _key():
+        raise ValueError("LLM 未配置：请在前端设置页面配置 LLM API URL 和 Key")
 
     prompt = _CLASSIFY_PROMPT.format(subtree=subtree, routing_cards=json.dumps(routing_cards, ensure_ascii=False, indent=2))
 
     async with aiohttp.ClientSession() as session:
         headers = {
-            "Authorization": f"Bearer {_default_key}",
+            "Authorization": f"Bearer {_key()}",
             "Content-Type": "application/json",
         }
         payload = {
-            "model": _default_model,
+            "model": _model(),
             "messages": [
                 {"role": "system", "content": "你是知识库分类助手。只返回 JSON。"},
                 {"role": "user", "content": prompt},
@@ -124,7 +166,48 @@ async def call_llm_for_classification(
         "taxonomy_version": 1,
         "operations": parsed.get("operations", []),
         "holds": parsed.get("holds", []),
-        "model_provider": _default_model.split("-")[0] if "-" in _default_model else _default_model,
+        "model_provider": _model().split("-")[0] if "-" in _model() else _model(),
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
     }
+
+
+async def test_connectivity() -> dict:
+    """Send a minimal request to the LLM API to verify connectivity.
+
+    Returns dict with ok, latency_ms, model, error fields.
+    """
+    import aiohttp
+    import time
+
+    base = _base()
+    key = _key()
+    model = _model()
+
+    if not base or not key:
+        return {"ok": False, "error": "LLM API URL 和 Key 未配置", "model": model}
+
+    models_url = f"{base}/models"
+    start = time.time()
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {"Authorization": f"Bearer {key}"}
+            async with session.get(models_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                latency_ms = int((time.time() - start) * 1000)
+                if resp.status == 200:
+                    data = await resp.json()
+                    models = [m.get("id", "") for m in data.get("data", [])]
+                    model_ok = not model or any(model in m for m in models)
+                    return {
+                        "ok": True,
+                        "latency_ms": latency_ms,
+                        "model": model,
+                        "model_found": model_ok,
+                        "available_models": models[:10],
+                    }
+                else:
+                    text = await resp.text()
+                    return {"ok": False, "error": f"HTTP {resp.status}: {text[:120]}", "model": model, "latency_ms": latency_ms}
+    except Exception as e:
+        latency_ms = int((time.time() - start) * 1000)
+        return {"ok": False, "error": str(e)[:200], "model": model, "latency_ms": latency_ms}
