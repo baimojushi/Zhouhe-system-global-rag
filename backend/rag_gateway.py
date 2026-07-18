@@ -25,6 +25,9 @@ import os
 import sys
 import logging
 import argparse
+import hashlib
+import hmac
+import mimetypes
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
@@ -33,13 +36,24 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("HF_HOME", "/opt/global-rag/cache/huggingface")
 os.environ.setdefault("DOCLING_ARTIFACTS_PATH", "/opt/global-rag/cache/docling-models")
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import weaviate
 import weaviate.classes as wvc
 from weaviate.auth import AuthApiKey
 from FlagEmbedding import FlagModel
+
+# Keep absolute imports: the deployed Gateway is launched directly as a script.
+from knowledge_store import (
+    DEFAULT_LIBRARIES,
+    DEFAULT_TREES,
+    KnowledgeStore,
+    StoreConflict,
+    StoreNotFound,
+    StoreValidationError,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -58,14 +72,16 @@ logging.basicConfig(
 )
 log = logging.getLogger("rag_gateway")
 
-# Load API key
+# Load API key.  Environment variables take precedence so tests and portable
+# deployments do not depend on the historic /opt/global-rag/stack path.
 env_path = Path("/opt/global-rag/stack/.env")
-api_key = ""
-with open(env_path) as f:
-    for line in f:
-        if line.startswith("WEAVIATE_API_KEY="):
-            api_key = line.split("=", 1)[1].strip().strip('"')
-            break
+api_key = os.environ.get("WEAVIATE_API_KEY", "").strip()
+if not api_key and env_path.exists():
+    with open(env_path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("WEAVIATE_API_KEY="):
+                api_key = line.split("=", 1)[1].strip().strip('"')
+                break
 
 if not api_key:
     raise RuntimeError("WEAVIATE_API_KEY not found in /opt/global-rag/stack/.env")
@@ -101,6 +117,8 @@ class RetrieveRequest(BaseModel):
     top_k: int = Field(default=5, ge=1, le=20)
     alpha: float = Field(default=0.55, ge=0.0, le=1.0)
     scope: str = Field(default="global")
+    library_id: Optional[str] = Field(default=None, description="Filter by library ID")
+    active_versions_only: bool = Field(default=True, description="Only return chunks from active document versions")
     return_fields: list[str] = ["content", "title", "heading", "source_path", "source_name", "page"]
 
 class IngestTextRequest(BaseModel):
@@ -123,6 +141,8 @@ class SearchKnowledgeRequest(BaseModel):
     query: str
     scope: str = "global"
     top_k: int = 5
+    library_id: Optional[str] = None
+    active_versions_only: bool = True
 
 class SearchContextRequest(BaseModel):
     query: str
@@ -141,9 +161,45 @@ class ForgetSessionRequest(BaseModel):
 # Helper Functions
 # ---------------------------------------------------------------------------
 
+def get_active_version_ids(library_id: str = None) -> list[str]:
+    """Get list of active version_ids, optionally filtered by library."""
+    if knowledge_store is None:
+        return []
+    try:
+        conn = knowledge_store._connect()
+        if library_id:
+            rows = conn.execute(
+                """SELECT dv.id FROM document_versions dv
+                   JOIN documents d ON d.current_version_id = dv.id
+                   WHERE d.library_id = ? AND d.current_version_id IS NOT NULL""",
+                (library_id,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT dv.id FROM document_versions dv
+                   JOIN documents d ON d.current_version_id = dv.id
+                   WHERE d.current_version_id IS NOT NULL"""
+            ).fetchall()
+        conn.close()
+        return [row["id"] for row in rows]
+    except Exception as e:
+        log.warning(f"Failed to get active version ids: {e}")
+        return []
+
 def hybrid_search(query: str, top_k: int = 5, alpha: float = 0.55,
-                  collection=None, filters: dict = None) -> list[dict]:
-    """Hybrid search with pre-computed vector (self_provided vectors)."""
+                  collection=None, filters: dict = None,
+                  library_id: str = None, active_versions_only: bool = True) -> list[dict]:
+    """Hybrid search with pre-computed vector (self_provided vectors).
+
+    Args:
+        query: Search query text
+        top_k: Number of results to return
+        alpha: Hybrid search alpha (0=pure BM25, 1=pure vector)
+        collection: Weaviate collection to search
+        filters: Additional filters dict
+        library_id: If provided, only search chunks from this library
+        active_versions_only: If True, only return chunks from active document versions
+    """
     model = get_model()
     query_vec = model.encode(query).tolist()
 
@@ -154,6 +210,23 @@ def hybrid_search(query: str, top_k: int = 5, alpha: float = 0.55,
             weaviate_filters.append(
                 wvc.query.Filter.by_property(key).equal(value)
             )
+
+    # Add library filter
+    if library_id:
+        weaviate_filters.append(
+            wvc.query.Filter.by_property("library_id").equal(library_id)
+        )
+
+    # Add active version filter
+    if active_versions_only:
+        active_versions = get_active_version_ids(library_id)
+        if active_versions:
+            weaviate_filters.append(
+                wvc.query.Filter.by_property("version_id").contains_any(active_versions)
+            )
+        elif library_id:
+            # No active versions in this library, return empty
+            return []
 
     if collection is None:
         collection = knowledge_coll
@@ -168,7 +241,7 @@ def hybrid_search(query: str, top_k: int = 5, alpha: float = 0.55,
         kwargs["filters"] = wvc.query.Filter.all_of(weaviate_filters)
 
     result = getattr(collection, "query").hybrid(**kwargs)
-    
+
     results = []
     for obj in result.objects:
         item = {
@@ -181,6 +254,8 @@ def hybrid_search(query: str, top_k: int = 5, alpha: float = 0.55,
             "page": obj.properties.get("page", 0),
             "scope": obj.properties.get("scope", ""),
             "mime_type": obj.properties.get("mime_type", ""),
+            "version_id": obj.properties.get("version_id", ""),
+            "document_id": obj.properties.get("document_id", ""),
         }
         results.append(item)
     return results
@@ -224,6 +299,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+MANAGEMENT_API_KEY = os.environ.get("RAG_GATEWAY_API_KEY", "").strip()
+
+
+def require_management_auth(authorization: Optional[str] = Header(default=None)) -> str:
+    """Protect V2 writes when RAG_GATEWAY_API_KEY is configured.
+
+    Local upgrades remain backward compatible when the variable is empty.  A
+    production deployment should always set it and send a Bearer token.
+    """
+    if not MANAGEMENT_API_KEY:
+        return "local-owner"
+    scheme, _, token = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not hmac.compare_digest(token, MANAGEMENT_API_KEY):
+        raise HTTPException(status_code=401, detail="invalid management bearer token")
+    return "local-owner"
+
+
+@app.exception_handler(StoreNotFound)
+async def store_not_found_handler(_request, exc: StoreNotFound):
+    return JSONResponse(status_code=404, content={"code": "not_found", "message": str(exc)})
+
+
+@app.exception_handler(StoreConflict)
+async def store_conflict_handler(_request, exc: StoreConflict):
+    return JSONResponse(status_code=409, content={"code": "conflict", "message": str(exc)})
+
+
+@app.exception_handler(StoreValidationError)
+async def store_validation_handler(_request, exc: StoreValidationError):
+    return JSONResponse(status_code=422, content={"code": "validation_error", "message": str(exc)})
+
 @app.get("/health")
 async def health():
     return {
@@ -234,19 +340,23 @@ async def health():
 
 @app.post("/v1/retrieve")
 async def retrieve(request: RetrieveRequest):
-    """Core retrieval endpoint — hybrid search."""
+    """Core retrieval endpoint — hybrid search with version-aware filtering."""
     try:
         results = hybrid_search(
             query=request.query,
             top_k=request.top_k,
             alpha=request.alpha,
             filters={"scope": request.scope},
+            library_id=request.library_id,
+            active_versions_only=request.active_versions_only,
         )
         return {
             "query": request.query,
             "top_k": request.top_k,
             "alpha": request.alpha,
             "scope": request.scope,
+            "library_id": request.library_id,
+            "active_versions_only": request.active_versions_only,
             "results": results,
             "count": len(results),
         }
@@ -324,17 +434,21 @@ async def store_memory(request: MemoryRequest):
 
 @app.post("/v1/retrieve/search_knowledge")
 async def search_knowledge_tool(request: SearchKnowledgeRequest):
-    """MCP tool: search knowledge base."""
+    """MCP tool: search knowledge base with version-aware filtering."""
     try:
         results = hybrid_search(
             query=request.query,
             top_k=request.top_k,
             alpha=0.55,
             filters={"scope": request.scope},
+            library_id=request.library_id,
+            active_versions_only=request.active_versions_only,
         )
         return {
             "tool": "search_knowledge",
             "query": request.query,
+            "library_id": request.library_id,
+            "active_versions_only": request.active_versions_only,
             "results": results,
             "count": len(results),
         }
@@ -525,7 +639,20 @@ PREDEFINED_TREES: dict[str, list[dict]] = {
     "association": [],
 }
 
-# Taxonomy version tracker (in-memory, serializable)
+# The persistent V2 store is the canonical registry.  Rebind the legacy V1
+# views to the same defaults so the two APIs cannot silently drift.
+LIBRARY_REGISTRY = {
+    item["id"]: {
+        "collection": item["collection_name"],
+        "name": item["name"],
+        "policy": item["policy"],
+    }
+    for item in DEFAULT_LIBRARIES
+}
+PREDEFINED_TREES = DEFAULT_TREES
+
+# V1 taxonomy proposal state remains compatibility-only.  V2 library, tree,
+# document, job and audit state is persisted in SQLite below.
 _taxonomy_version: dict[str, int] = {lid: 1 for lid in LIBRARY_REGISTRY}
 _change_set_store: dict[str, dict] = {}
 
@@ -583,9 +710,14 @@ def _seed_taxonomy_nodes(coll: Optional[object]):
     for library_id, tree in PREDEFINED_TREES.items():
         version = _taxonomy_version.get(library_id, 1)
         nodes = _build_flat_nodes(tree, library_id)
-        # Only seed if collection is empty
-        count = coll.aggregate.over_all(total_count=True).total_count
-        if count > 0:
+        # Check each library independently.  Checking the collection-wide count
+        # caused the first seeded library to suppress every library after it.
+        existing = coll.query.fetch_objects(
+            filters=wvc.query.Filter.by_property("library_id").equal(library_id),
+            limit=1,
+            include_vector=False,
+        )
+        if existing.objects:
             continue
         for node in nodes:
             node["version_created"] = version
@@ -623,6 +755,9 @@ class TaxonomyProposalRequest(BaseModel):
 class TaxonomyProposalApplyRequest(BaseModel):
     expected_taxonomy_version: int
 
+class ProposalItemActionRequest(BaseModel):
+    reason: str = ""
+
 class IngestPathRequest(BaseModel):
     path: str
     library_id: str
@@ -636,157 +771,503 @@ class KnowledgeEdgeRequest(BaseModel):
     edge_budget: int = Field(default=12, ge=1, le=50)
 
 
+# --- V2 persistent control-plane models ---
+
+class V2LibraryCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    library_id: Optional[str] = None
+    kind: str = Field(default="document", description="document | association")
+    policy: str = "private · manual-first"
+    description: str = ""
+
+
+class V2LibraryUpdateRequest(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    description: Optional[str] = None
+    policy: Optional[str] = None
+    status: Optional[str] = None
+
+
+class V2NodeCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    parent_id: Optional[str] = None
+    description: str = ""
+    kind: str = Field(default="physical", description="physical | smart | alias")
+    expected_taxonomy_version: Optional[int] = None
+
+
+class V2NodeUpdateRequest(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    description: Optional[str] = None
+    locked: Optional[bool] = None
+    kind: Optional[str] = None
+    expected_taxonomy_version: Optional[int] = None
+
+
+class V2NodeMoveRequest(BaseModel):
+    new_parent_id: Optional[str] = None
+    position: Optional[int] = Field(default=None, ge=0)
+    expected_taxonomy_version: Optional[int] = None
+
+
+class V2NodeArchiveRequest(BaseModel):
+    expected_taxonomy_version: Optional[int] = None
+
+
+class V2DocumentCreateRequest(BaseModel):
+    library_id: str
+    title: str = Field(min_length=1, max_length=500)
+    node_id: str
+    mime_type: str = "application/octet-stream"
+    source_path: str = ""
+    source_name: str = ""
+    content_hash: str = ""
+    size_bytes: int = Field(default=0, ge=0)
+    index_status: str = "pending"
+
+
+class V2DocumentUpdateRequest(BaseModel):
+    title: Optional[str] = Field(default=None, min_length=1, max_length=500)
+    status: Optional[str] = None
+    index_status: Optional[str] = None
+    owner: Optional[str] = None
+    metadata: Optional[dict] = None
+
+
+class V2DocumentMoveRequest(BaseModel):
+    document_ids: list[str] = Field(min_length=1, max_length=1000)
+    target_node_id: str
+
+
+class V2AliasRequest(BaseModel):
+    node_id: str
+
+
+class V2TagCreateRequest(BaseModel):
+    library_id: str
+    name: str = Field(min_length=1, max_length=80)
+    color: str = ""
+
+
+class V2DocumentTagsRequest(BaseModel):
+    tag_ids: list[str] = Field(default_factory=list, max_length=100)
+
+
+class V2IngestPathRequest(BaseModel):
+    path: str = Field(min_length=1)
+    library_id: str
+    target_node_id: str
+
+
+CONTROL_DB_PATH = os.environ.get(
+    "RAG_CONTROL_DB", "/opt/global-rag/data/knowledge-control.db"
+)
+knowledge_store = KnowledgeStore(CONTROL_DB_PATH)
+
+
+def _model_fields(model: BaseModel, *excluded: str) -> dict:
+    """Return explicitly supplied fields under Pydantic v1 or v2."""
+    if hasattr(model, "model_dump"):
+        data = model.model_dump(exclude_unset=True)
+    else:
+        data = model.dict(exclude_unset=True)
+    for key in excluded:
+        data.pop(key, None)
+    return data
+
+
+def _allowed_ingest_roots() -> list[Path]:
+    configured = os.environ.get("RAG_INGEST_ROOTS", "/opt/global-rag/kb")
+    roots = []
+    for raw in configured.split(os.pathsep):
+        raw = raw.strip()
+        if raw:
+            roots.append(Path(raw).expanduser().resolve(strict=False))
+    return roots
+
+
+def _resolve_allowed_ingest_path(raw_path: str) -> Path:
+    candidate = Path(raw_path).expanduser().resolve(strict=True)
+    for root in _allowed_ingest_roots():
+        try:
+            candidate.relative_to(root)
+            return candidate
+        except ValueError:
+            continue
+    allowed = ", ".join(str(root) for root in _allowed_ingest_roots())
+    raise StoreValidationError(f"path is outside RAG_INGEST_ROOTS: {allowed}")
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 # --- Routes ---
 
+@app.get("/v2/control/health")
+async def v2_control_health():
+    return {"status": "ok", "database": str(CONTROL_DB_PATH), **knowledge_store.stats()}
+
+
+@app.get("/v2/libraries")
+async def v2_list_libraries(include_archived: bool = False):
+    return {"libraries": knowledge_store.list_libraries(include_archived)}
+
+
+@app.post("/v2/libraries", status_code=201)
+async def v2_create_library(
+    request: V2LibraryCreateRequest,
+    actor: str = Depends(require_management_auth),
+):
+    return knowledge_store.create_library(
+        name=request.name,
+        library_id=request.library_id,
+        kind=request.kind,
+        policy=request.policy,
+        description=request.description,
+        actor=actor,
+    )
+
+
+@app.patch("/v2/libraries/{library_id}")
+async def v2_update_library(
+    library_id: str,
+    request: V2LibraryUpdateRequest,
+    actor: str = Depends(require_management_auth),
+):
+    return knowledge_store.update_library(
+        library_id, _model_fields(request), actor=actor
+    )
+
+
+@app.get("/v2/libraries/{library_id}/tree")
+async def v2_get_library_tree(library_id: str, include_archived: bool = False):
+    return knowledge_store.get_tree(library_id, include_archived)
+
+
+@app.post("/v2/libraries/{library_id}/nodes", status_code=201)
+async def v2_create_node(
+    library_id: str,
+    request: V2NodeCreateRequest,
+    actor: str = Depends(require_management_auth),
+):
+    return knowledge_store.create_node(
+        library_id=library_id,
+        name=request.name,
+        parent_id=request.parent_id,
+        description=request.description,
+        kind=request.kind,
+        expected_version=request.expected_taxonomy_version,
+        actor=actor,
+    )
+
+
+@app.patch("/v2/nodes/{node_id}")
+async def v2_update_node(
+    node_id: str,
+    request: V2NodeUpdateRequest,
+    actor: str = Depends(require_management_auth),
+):
+    return knowledge_store.update_node(
+        node_id,
+        _model_fields(request, "expected_taxonomy_version"),
+        expected_version=request.expected_taxonomy_version,
+        actor=actor,
+    )
+
+
+@app.post("/v2/nodes/{node_id}:move")
+async def v2_move_node(
+    node_id: str,
+    request: V2NodeMoveRequest,
+    actor: str = Depends(require_management_auth),
+):
+    return knowledge_store.move_node(
+        node_id,
+        request.new_parent_id,
+        position=request.position,
+        expected_version=request.expected_taxonomy_version,
+        actor=actor,
+    )
+
+
+@app.post("/v2/nodes/{node_id}:archive")
+async def v2_archive_node(
+    node_id: str,
+    request: V2NodeArchiveRequest,
+    actor: str = Depends(require_management_auth),
+):
+    return knowledge_store.archive_node(
+        node_id,
+        expected_version=request.expected_taxonomy_version,
+        actor=actor,
+    )
+
+
+@app.get("/v2/documents")
+async def v2_list_documents(
+    library_id: str,
+    node_id: Optional[str] = None,
+    q: str = "",
+    status: Optional[str] = None,
+    limit: int = 50,
+    cursor: Optional[str] = None,
+):
+    return knowledge_store.list_documents(
+        library_id, node_id=node_id, query=q, status=status, limit=limit, cursor=cursor
+    )
+
+
+@app.post("/v2/documents", status_code=201)
+async def v2_create_document(
+    request: V2DocumentCreateRequest,
+    actor: str = Depends(require_management_auth),
+):
+    return knowledge_store.create_document(
+        library_id=request.library_id,
+        title=request.title,
+        node_id=request.node_id,
+        mime_type=request.mime_type,
+        source_path=request.source_path,
+        source_name=request.source_name,
+        content_hash=request.content_hash,
+        size_bytes=request.size_bytes,
+        index_status=request.index_status,
+        actor=actor,
+    )
+
+
+@app.post("/v2/document-actions/move")
+async def v2_move_documents(
+    request: V2DocumentMoveRequest,
+    actor: str = Depends(require_management_auth),
+):
+    return knowledge_store.move_documents(
+        request.document_ids, request.target_node_id, actor=actor
+    )
+
+
+@app.get("/v2/documents/{document_id}")
+async def v2_get_document(document_id: str):
+    return knowledge_store.get_document(document_id)
+
+
+@app.patch("/v2/documents/{document_id}")
+async def v2_update_document(
+    document_id: str,
+    request: V2DocumentUpdateRequest,
+    actor: str = Depends(require_management_auth),
+):
+    return knowledge_store.update_document(
+        document_id, _model_fields(request), actor=actor
+    )
+
+
+@app.post("/v2/documents/{document_id}/aliases", status_code=201)
+async def v2_add_document_alias(
+    document_id: str,
+    request: V2AliasRequest,
+    actor: str = Depends(require_management_auth),
+):
+    return knowledge_store.add_alias(document_id, request.node_id, actor=actor)
+
+
+@app.delete("/v2/documents/{document_id}/aliases/{node_id}")
+async def v2_remove_document_alias(
+    document_id: str,
+    node_id: str,
+    actor: str = Depends(require_management_auth),
+):
+    return knowledge_store.remove_alias(document_id, node_id, actor=actor)
+
+
+@app.get("/v2/tags")
+async def v2_list_tags(library_id: str):
+    return {"tags": knowledge_store.list_tags(library_id)}
+
+
+@app.post("/v2/tags", status_code=201)
+async def v2_create_tag(
+    request: V2TagCreateRequest,
+    _actor: str = Depends(require_management_auth),
+):
+    return knowledge_store.create_tag(request.library_id, request.name, request.color)
+
+
+@app.put("/v2/documents/{document_id}/tags")
+async def v2_set_document_tags(
+    document_id: str,
+    request: V2DocumentTagsRequest,
+    _actor: str = Depends(require_management_auth),
+):
+    return knowledge_store.set_document_tags(document_id, request.tag_ids)
+
+
+@app.post("/v2/ingest/path", status_code=202)
+async def v2_ingest_path(
+    request: V2IngestPathRequest,
+    actor: str = Depends(require_management_auth),
+):
+    path = _resolve_allowed_ingest_path(request.path)
+    stat = path.stat()
+    identity = f"{path}:{stat.st_size}:{stat.st_mtime_ns}"
+    idempotency_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    document_id = None
+    if path.is_file():
+        content_hash = _hash_file(path)
+        document = knowledge_store.create_document(
+            library_id=request.library_id,
+            title=path.name,
+            node_id=request.target_node_id,
+            mime_type=mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+            source_path=str(path),
+            source_name=path.name,
+            content_hash=content_hash,
+            size_bytes=stat.st_size,
+            index_status="queued",
+            actor=actor,
+            idempotent=True,
+        )
+        document_id = document["id"]
+    job = knowledge_store.queue_ingest(
+        request.library_id,
+        request.target_node_id,
+        str(path),
+        idempotency_key,
+        document_id=document_id,
+    )
+    return {"status": "queued", "job": job, "document_id": document_id}
+
+
+@app.get("/v2/jobs")
+async def v2_list_jobs(library_id: Optional[str] = None, limit: int = 50):
+    return {"jobs": knowledge_store.list_jobs(library_id, limit)}
+
+
+@app.get("/v2/libraries/{library_id}/audit")
+async def v2_list_audit(library_id: str, limit: int = 50):
+    return {"events": knowledge_store.list_audit_events(library_id, limit)}
+
+@app.get("/v1/libraries")
 @app.post("/v1/libraries")
 async def list_libraries():
-    """List all configured knowledge libraries."""
-    libs = []
-    for lid, info in LIBRARY_REGISTRY.items():
-        coll_name = info["collection"]
-        try:
-            coll = weaviate_client.collections.get(coll_name)
-            count = coll.aggregate.over_all(total_count=True).total_count
-        except Exception:
-            count = 0
-        libs.append({
-            "library_id": lid,
-            **info,
-            "taxonomy_version": _taxonomy_version.get(lid, 1),
-            "document_count": count,
-        })
-    return {"libraries": libs}
+    """Compatibility view backed by the persistent V2 control plane."""
+    return {"libraries": [
+        {
+            "library_id": item["id"],
+            "collection": item["collection_name"],
+            "name": item["name"],
+            "policy": item["policy"],
+            "taxonomy_version": item["taxonomy_version"],
+            "document_count": item["document_count"],
+            "unclassified_count": item["unclassified_count"],
+        }
+        for item in knowledge_store.list_libraries()
+    ]}
 
 
 @app.get("/v1/libraries/{library_id}/tree")
 async def get_library_tree(library_id: str, version: Optional[int] = None):
-    """Get the taxonomy tree for a library."""
-    if library_id not in LIBRARY_REGISTRY:
-        raise HTTPException(status_code=404, detail=f"Library '{library_id}' not found")
-    tree_version = version or _taxonomy_version.get(library_id, 1)
-    return {
-        "library_id": library_id,
-        "version": tree_version,
-        "tree": PREDEFINED_TREES.get(library_id, []),
-    }
+    """Get the live taxonomy tree; version is retained for V1 compatibility."""
+    result = knowledge_store.get_tree(library_id)
+    if version is not None and version != result["version"]:
+        raise HTTPException(status_code=409, detail="requested taxonomy version is not current")
+    return result
 
 
 @app.post("/v1/ingest/path")
 async def ingest_path(request: IngestPathRequest):
-    """Queue a local file path for ingestion into a library's unclassified node."""
-    if request.library_id not in LIBRARY_REGISTRY:
-        raise HTTPException(status_code=404, detail=f"Library '{request.library_id}' not found")
+    """Compatibility ingest route; jobs are never stored as zero-vector chunks."""
+    path = _resolve_allowed_ingest_path(request.path)
+    tree = knowledge_store.get_tree(request.library_id)
+    flat_nodes = []
 
-    import hashlib
-    import json
-    from pathlib import Path as PPath
+    def flatten(nodes):
+        for item in nodes:
+            flat_nodes.append(item)
+            flatten(item.get("children", []))
 
-    kb_path = PPath(request.path)
-    if not kb_path.exists():
-        raise HTTPException(status_code=400, detail=f"File not found: {request.path}")
-
-    file_hash = hashlib.sha256(kb_path.read_bytes()).hexdigest()[:16]
-    chunk_id = f"path-{file_hash}"
-
-    # Store ingest job metadata (in Weaviate KnowledgeChunk with scope=ingest-queue)
-    ingest_coll = weaviate_client.collections.get("KnowledgeChunk")
-    ingest_coll.data.insert(
-        properties={
-            "chunk_id": chunk_id,
-            "content": f"[ingest-queue] {request.path}",
-            "title": kb_path.name,
-            "heading": "ingest",
-            "source_path": request.path,
-            "source_name": kb_path.name,
-            "source_hash": file_hash,
-            "mime_type": "path-reference",
-            "page": 0,
-            "chunk_index": 0,
-            "scope": "ingest-queue",
-            "library_id": request.library_id,
-            "target_node": request.target_node,
-            "classification": request.classification,
-            "modified_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        },
-        vector=[0.0] * 1024,  # Placeholder — will be re-encoded by batch indexer
+    flatten(tree["tree"])
+    target = next((item for item in flat_nodes if item["id"] == request.target_node), None)
+    if target is None:
+        target = next((item for item in flat_nodes if item["is_unclassified"]), None)
+    if target is None:
+        raise StoreValidationError("library has no unclassified node")
+    stat = path.stat()
+    identity = f"{path}:{stat.st_size}:{stat.st_mtime_ns}"
+    key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    document_id = None
+    if path.is_file():
+        document = knowledge_store.create_document(
+            request.library_id,
+            path.name,
+            target["id"],
+            mime_type=mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+            source_path=str(path),
+            source_name=path.name,
+            content_hash=_hash_file(path),
+            size_bytes=stat.st_size,
+            index_status="queued",
+            idempotent=True,
+        )
+        document_id = document["id"]
+    job = knowledge_store.queue_ingest(
+        request.library_id, target["id"], str(path), key, document_id
     )
     return {
         "status": "queued",
-        "chunk_id": chunk_id,
-        "path": request.path,
+        "job_id": job["id"],
+        "document_id": document_id,
+        "path": str(path),
         "library_id": request.library_id,
-        "target_node": request.target_node,
+        "target_node": target["id"],
     }
 
 
 @app.post("/v1/taxonomy/proposals")
 async def create_taxonomy_proposal(request: TaxonomyProposalRequest):
-    """Generate an AI-powered taxonomy classification proposal.
+    """Generate an AI-powered taxonomy classification proposal (V2 persistent).
 
     Workflow:
-    1. Find all files in source_node (unclassified)
-    2. Generate routing cards for each file
-    3. Load affected subtree (parent, siblings, children of source_node)
+    1. Find all unclassified documents in the library
+    2. Generate routing cards for each document
+    3. Load affected subtree
     4. Send routing cards + subtree to LLM adapter
-    5. Parse LLM JSON response into operations/holds
-    6. Store change_set in memory, return preview
+    5. Parse LLM JSON response into proposal items
+    6. Store proposal in SQLite, return preview
     """
-    if request.library_id not in LIBRARY_REGISTRY:
-        raise HTTPException(status_code=404, detail=f"Library '{request.library_id}' not found")
+    if knowledge_store is None:
+        raise HTTPException(status_code=503, detail="Knowledge store not initialized")
 
     try:
-        # --- Step 1: Find unclassified files ---
-        # The batch indexer sets scope="global" for all files.
-        # Files that haven't been moved to a library node are considered unclassified.
-        # Search for files with scope="global" (not yet classified into a library).
-        coll_name = LIBRARY_REGISTRY[request.library_id]["collection"]
-        kb_coll = weaviate_client.collections.get(coll_name)
-        where_filter = wvc.query.Filter.by_property("scope").equal("global")
-        query_text = f"{LIBRARY_REGISTRY[request.library_id]['name']} {request.library_id}"
-        query_vec = get_model().encode(query_text).tolist()
-
-        result = kb_coll.query.hybrid(
-            query=query_text, limit=request.max_routing_cards,
-            alpha=0.5, vector=query_vec, filters=where_filter,
-            include_vector=False,
-        )
-        unclassified_chunks = []
-        for obj in result.objects:
-            props = obj.properties
-            if props.get("source_name") and props.get("source_hash"):
-                unclassified_chunks.append({
-                    "file_id": f"file-{props['source_hash']}",
-                    "source_hash": props["source_hash"],
-                    "source_name": props["source_name"],
-                    "source_path": props.get("source_path", ""),
-                    "title": props.get("title", ""),
-                    "heading": props.get("heading", ""),
-                    "mime_type": props.get("mime_type", "text/plain"),
-                })
-
-        if not unclassified_chunks:
+        # Step 1: Find unclassified documents
+        docs = knowledge_store.list_documents(request.library_id, status="unclassified", limit=request.max_routing_cards)
+        if docs["count"] == 0:
             return {
                 "status": "preview",
-                "operations": [],
-                "holds": [],
-                "taxonomy_version": _taxonomy_version.get(request.library_id, 1),
+                "proposal_id": None,
+                "items": [],
                 "routing_cards_count": 0,
+                "message": "No unclassified documents found",
             }
 
-        # --- Step 2: Build routing cards ---
+        # Step 2: Build routing cards
         routing_cards = []
-        for chunk in unclassified_chunks[:request.max_routing_cards]:
-            title = chunk["title"] or chunk["source_name"]
-            # Simple entity/signal extraction (local heuristic)
-            text_lower = (title + " " + chunk["heading"]).lower()
+        for doc in docs["items"]:
+            title = doc["title"] or doc["source_name"]
+            text_lower = title.lower()
             signals = []
             if any(w in text_lower for w in ["gpu", "oom", "memory", "cuda", "vllm"]):
                 signals.append("gpu-debug")
-            if any(w in text_lower for w in ["deploy", "install", "setup", "ws"]):
+            if any(w in text_lower for w in ["deploy", "install", "setup", "wsl", "docker"]):
                 signals.append("deployment")
             if any(w in text_lower for w in ["test", "benchmark", "perf", "eval"]):
                 signals.append("benchmark")
-            if any(w in text_lower for w in ["prompt", "api", "chat", "agent"]):
+            if any(w in text_lower for w in ["prompt", "api", "chat", "agent", "llm"]):
                 signals.append("llm")
             if any(w in text_lower for w in ["vector", "embed", "weaviate", "search", "retriev"]):
                 signals.append("vector")
@@ -794,53 +1275,77 @@ async def create_taxonomy_proposal(request: TaxonomyProposalRequest):
                 signals.append("notes")
             if not signals:
                 signals.append("general")
+
             routing_cards.append({
-                "file_id": chunk["file_id"],
+                "document_id": doc["id"],
                 "title": title,
-                "mime": chunk["mime_type"],
-                "headings": [chunk["heading"]] if chunk["heading"] else [],
+                "mime": doc["mime_type"],
+                "source_name": doc["source_name"],
                 "summary": title,
-                "entities": chunk["source_name"].split(".")[0].split("_"),
                 "signals": signals,
-                "content_hash": chunk["source_hash"],
+                "content_hash": doc["content_hash"],
             })
 
-        # --- Step 3: Load affected subtree ---
+        # Step 3: Load subtree
         subtree = PREDEFINED_TREES.get(request.library_id, [])
         subtree_json = json.dumps(subtree, ensure_ascii=False, indent=2)
 
-        # --- Step 4: Build prompt for LLM ---
-        from llm_adapter import call_llm_for_classification  # Lazy import
-        proposal_id = f"proposal-{request.library_id}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-        change_set = {
-            "change_set_id": proposal_id,
-            "library_id": request.library_id,
-            "base_version": _taxonomy_version.get(request.library_id, 1),
-            "status": "preview",
-            "requested_by": "auto-classifier",
-            "operations_json": [],
-            "operations": [],
-            "holds": [],
-            "routing_cards_count": len(routing_cards),
-            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }
-
+        # Step 4: Call LLM
+        from llm_adapter import call_llm_for_classification
         try:
             classification_result = await call_llm_for_classification(
                 library_id=request.library_id,
                 subtree=subtree_json,
                 routing_cards=routing_cards,
             )
-            change_set.update(classification_result)
-            _change_set_store[proposal_id] = change_set
+            llm_model = classification_result.get("model_provider", "unknown")
+            llm_response = classification_result
+            prompt_tokens = classification_result.get("prompt_tokens", 0)
+            completion_tokens = classification_result.get("completion_tokens", 0)
         except Exception as llm_err:
             log.warning(f"LLM classification failed: {llm_err}. Falling back to rule-based.")
-            # Rule-based fallback
             fallback = _rule_based_classify(routing_cards, request.library_id)
-            change_set.update(fallback)
-            _change_set_store[proposal_id] = change_set
+            llm_model = "rule-based-fallback"
+            llm_response = fallback
+            prompt_tokens = 0
+            completion_tokens = 0
 
-        return change_set
+        # Step 5: Create proposal in SQLite
+        proposal = knowledge_store.create_proposal(
+            library_id=request.library_id,
+            llm_model=llm_model,
+            llm_response=llm_response,
+            routing_cards=routing_cards,
+            subtree=subtree,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+
+        # Step 6: Add proposal items
+        operations = llm_response.get("operations", [])
+        items = []
+        for op in operations:
+            try:
+                item = knowledge_store.add_proposal_item(
+                    proposal_id=proposal["id"],
+                    document_id=op["file_id"].replace("file-", "doc-") if op["file_id"].startswith("file-") else op.get("document_id", ""),
+                    source_node_id=request.source_node if request.source_node != "unclassified" else f"{request.library_id[:2]}-unclassified",
+                    target_node_id=op["target_node_id"],
+                    confidence=op.get("confidence", 0.0),
+                    reason_code=op.get("reason_code", ""),
+                    llm_reasoning=op.get("reasoning", ""),
+                )
+                items.append(item)
+            except Exception as item_err:
+                log.warning(f"Failed to add proposal item: {item_err}")
+
+        return {
+            "status": "preview",
+            "proposal_id": proposal["id"],
+            "items": items,
+            "routing_cards_count": len(routing_cards),
+            "llm_model": llm_model,
+        }
 
     except Exception as e:
         log.error(f"Taxonomy proposal error: {e}", exc_info=True)
@@ -902,70 +1407,97 @@ def _rule_based_classify(routing_cards: list[dict], library_id: str) -> dict:
     }
 
 
+@app.get("/v1/taxonomy/proposals")
+async def list_taxonomy_proposals(library_id: Optional[str] = None, status: Optional[str] = None, limit: int = 50):
+    """List classification proposals."""
+    if knowledge_store is None:
+        raise HTTPException(status_code=503, detail="Knowledge store not initialized")
+    try:
+        proposals = knowledge_store.list_proposals(library_id=library_id, status=status, limit=limit)
+        return {"proposals": proposals, "count": len(proposals)}
+    except Exception as e:
+        log.error(f"List proposals error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/v1/taxonomy/proposals/{proposal_id}")
 async def get_taxonomy_proposal(proposal_id: str):
-    """Get a taxonomy proposal by ID."""
-    cs = _change_set_store.get(proposal_id)
-    if not cs:
-        raise HTTPException(status_code=404, detail=f"Proposal '{proposal_id}' not found")
-    return cs
+    """Get a taxonomy proposal with its items."""
+    if knowledge_store is None:
+        raise HTTPException(status_code=503, detail="Knowledge store not initialized")
+    try:
+        proposal = knowledge_store.get_proposal(proposal_id)
+        return proposal
+    except StoreNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        log.error(f"Get proposal error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/taxonomy/proposals/{proposal_id}/approve/{item_id}")
+async def approve_proposal_item(proposal_id: str, item_id: str):
+    """Approve a proposal item."""
+    if knowledge_store is None:
+        raise HTTPException(status_code=503, detail="Knowledge store not initialized")
+    try:
+        item = knowledge_store.approve_proposal_item(item_id)
+        return {"status": "approved", "item": item}
+    except StoreNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except StoreValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        log.error(f"Approve item error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/taxonomy/proposals/{proposal_id}/reject/{item_id}")
+async def reject_proposal_item(proposal_id: str, item_id: str, request: ProposalItemActionRequest = None):
+    """Reject a proposal item."""
+    if knowledge_store is None:
+        raise HTTPException(status_code=503, detail="Knowledge store not initialized")
+    try:
+        reason = request.reason if request else ""
+        item = knowledge_store.reject_proposal_item(item_id, reason=reason)
+        return {"status": "rejected", "item": item}
+    except StoreNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except StoreValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        log.error(f"Reject item error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/v1/taxonomy/proposals/{proposal_id}/apply")
-async def apply_taxonomy_proposal(proposal_id: str, request: TaxonomyProposalApplyRequest):
-    """Apply a taxonomy proposal (move files to new nodes)."""
-    cs = _change_set_store.get(proposal_id)
-    if not cs:
-        raise HTTPException(status_code=404, detail=f"Proposal '{proposal_id}' not found")
-    if cs.get("status") != "preview":
-        raise HTTPException(status_code=400, detail="Proposal already applied")
+async def apply_taxonomy_proposal(proposal_id: str, request: TaxonomyProposalApplyRequest = None):
+    """Apply all approved items in a proposal."""
+    if knowledge_store is None:
+        raise HTTPException(status_code=503, detail="Knowledge store not initialized")
+    try:
+        result = knowledge_store.apply_proposal(proposal_id)
+        return result
+    except StoreNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        log.error(f"Apply proposal error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
-    expected_version = request.expected_taxonomy_version
-    actual_version = _taxonomy_version.get(cs["library_id"], 1)
-    if expected_version != actual_version:
-        raise HTTPException(status_code=409, detail=f"taxonomy_version_conflict: expected {expected_version}, got {actual_version}")
 
-    # Apply operations: update scope of KnowledgeChunks from "unclassified" to target node
-    operations = cs.get("operations", [])
-    library_id = cs["library_id"]
-    coll_name = LIBRARY_REGISTRY[library_id]["collection"]
-    kb_coll = weaviate_client.collections.get(coll_name)
-
-    applied_count = 0
-    for op in operations:
-        file_id = op["file_id"]
-        hash_prefix = file_id.replace("file-", "")
-        target_scope = f"{library_id}/{op['target_node_id']}"
-
-        # Find and update all matching chunks
-        where_filter = wvc.query.Filter.by_property("scope").equal("global")
-        result = kb_coll.query.hybrid(
-            query="", limit=50, alpha=1.0,
-            filters=where_filter, include_vector=False,
-        )
-        for obj in result.objects:
-            source_hash = obj.properties.get("source_hash", "")
-            if source_hash.startswith(hash_prefix[:8]):
-                kb_coll.properties.update(
-                    uuid=obj.uuid,
-                    properties={"scope": target_scope},
-                )
-                applied_count += 1
-
-    # Update change_set status
-    cs["status"] = "applied"
-    cs["applied_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    cs["applied_count"] = applied_count
-
-    # Bump taxonomy version
-    _taxonomy_version[library_id] = actual_version + 1
-
-    return {
-        "status": "applied",
-        "change_set_id": proposal_id,
-        "applied_count": applied_count,
-        "new_version": _taxonomy_version[library_id],
-    }
+@app.post("/v1/taxonomy/proposals/{proposal_id}/revert")
+async def revert_taxonomy_proposal(proposal_id: str):
+    """Revert all applied items in a proposal."""
+    if knowledge_store is None:
+        raise HTTPException(status_code=503, detail="Knowledge store not initialized")
+    try:
+        result = knowledge_store.revert_proposal(proposal_id)
+        return result
+    except StoreNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        log.error(f"Revert proposal error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/v1/associations/discover")
@@ -1000,9 +1532,7 @@ if __name__ == "__main__":
 
     import uvicorn
     log.info(f"Starting RAG Gateway on {args.host}:{args.port}")
-    uvicorn.run(
-        "rag_gateway:app",
-        host=args.host,
-        port=args.port,
-        log_level="info",
-    )
+    # Pass the existing app object.  Using "rag_gateway:app" after executing
+    # this file directly imports the module a second time and can duplicate
+    # Weaviate connections and schema initialization.
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")

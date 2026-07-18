@@ -139,7 +139,9 @@ async def call_llm_for_classification(
             "response_format": {"type": "json_object"},
         }
 
-        url = f"{_default_base}/chat/completions"
+        # Respect the runtime-configured provider.  Using _default_base here
+        # silently ignored changes made after process start.
+        url = f"{_base().rstrip('/')}/chat/completions"
         async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=120)) as resp:
             if resp.status != 200:
                 text = await resp.text()
@@ -187,7 +189,7 @@ async def test_connectivity() -> dict:
     if not base or not key:
         return {"ok": False, "error": "LLM API URL 和 Key 未配置", "model": model}
 
-    models_url = f"{base}/models"
+    models_url = f"{base.rstrip('/')}/models"
     start = time.time()
     try:
         async with aiohttp.ClientSession() as session:
