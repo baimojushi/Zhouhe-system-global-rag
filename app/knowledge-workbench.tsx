@@ -53,6 +53,7 @@ type DocumentRecord = {
   status: "unclassified" | "active" | "archived" | "trash";
   index_status: string;
   owner: string;
+  current_version_id?:string|null;
   revision: number;
   primary_node_id: string | null;
   primary_node_name: string | null;
@@ -64,8 +65,10 @@ type DocumentRecord = {
 };
 
 type TagRecord = { id: string; name: string; color: string; document_count: number };
-type JobRecord = { id: string; state: string; source_path: string; progress: number; created_at: string };
-type AuditRecord = { id: string; action: string; target_type: string; created_at: string };
+type DocumentVersion={id:string;version_number:number;index_status:string;chunk_count:number;created_at:string};
+type JobRecord={id:string;state:string;source_path:string;progress:number;error?:string;retry_count?:number;max_retries?:number;worker_id?:string;chunks_indexed?:number;created_at:string};
+type AuditRecord={id:string;action:string;target_type:string;target_id?:string;actor?:string;created_at:string};
+type KnowledgeEdge={id:string;source_title:string;target_title:string;relation_type:string;confidence:number;status:"candidate"|"confirmed"|"rejected";revision:number};
 type ProposalStatus = "draft" | "reviewing" | "reviewed" | "applied" | "reverted";
 type ProposalItemStatus = "pending" | "approved" | "rejected" | "applied" | "reverted";
 type ProposalItem = {
@@ -116,6 +119,7 @@ type ProposalCreateResult = {
 
 type DialogState =
   | { type: "library" }
+  | { type:"library-settings" }
   | { type: "node"; parentId: string | null }
   | { type: "edit-node"; node: TreeNode }
   | null;
@@ -320,6 +324,7 @@ export function KnowledgeWorkbench({
   const [documents, setDocuments] = useState<DocumentRecord[]>(demoDocuments);
   const [selectedDocuments, setSelectedDocuments] = useState<Set<string>>(new Set());
   const [focusedDocument, setFocusedDocument] = useState<DocumentRecord | null>(null);
+  const [documentVersions,setDocumentVersions]=useState<DocumentVersion[]>([]);const [documentDraft,setDocumentDraft]=useState({title:"",owner:"",metadata:"{}"});
   const [tags, setTags] = useState<TagRecord[]>([]);
   const [jobs, setJobs] = useState<JobRecord[]>([]);
   const [audit, setAudit] = useState<AuditRecord[]>([]);
@@ -338,6 +343,7 @@ export function KnowledgeWorkbench({
   const [proposalPanelOpen, setProposalPanelOpen] = useState(false);
   const [proposalLoading, setProposalLoading] = useState(false);
   const [proposalAction, setProposalAction] = useState("");
+  const [managementView,setManagementView]=useState<"browse"|"jobs"|"audit"|"associations">("browse");const [librarySettings,setLibrarySettings]=useState({name:"",description:"",policy:"",status:"active"});const [statusFilter,setStatusFilter]=useState("");const [edges,setEdges]=useState<KnowledgeEdge[]>([]);const [edgeDocuments,setEdgeDocuments]=useState<DocumentRecord[]>([]);const [edgeDraft,setEdgeDraft]=useState({source:"",target:"",relation:"related",confidence:"0.7"});
 
   const gatewayBase = gatewayUrl.replace(/\/$/, "");
 
@@ -411,6 +417,7 @@ export function KnowledgeWorkbench({
       const params = new URLSearchParams({ library_id: libraryId, limit: "100" });
       if (nodeId) params.set("node_id", nodeId);
       if (query.trim()) params.set("q", query.trim());
+      if(statusFilter)params.set("status",statusFilter);
       const data = await callGateway<{ items: DocumentRecord[] }>(`/v2/documents?${params}`);
       setDocuments(data.items);
       setSelectedDocuments(new Set());
@@ -418,7 +425,7 @@ export function KnowledgeWorkbench({
     } catch (error) {
       setConnectionError(error instanceof Error ? error.message : "文档列表加载失败");
     }
-  }, [callGateway, demoMode, tree]);
+  }, [callGateway,demoMode,statusFilter,tree]);
 
   const loadSideData = useCallback(async (libraryId: string) => {
     if (demoMode) {
@@ -471,6 +478,9 @@ export function KnowledgeWorkbench({
       setProposalLoading(false);
     }
   }, [callGateway, demoMode, onNotice]);
+  const focusDocument=useCallback(async(d:DocumentRecord)=>{setFocusedDocument(d);setDocumentDraft({title:d.title,owner:d.owner,metadata:JSON.stringify(d.metadata??{},null,2)});if(!demoMode){const [detail,v]=await Promise.all([callGateway<DocumentRecord>(`/v2/documents/${d.id}`),callGateway<{versions:DocumentVersion[]}>(`/v2/documents/${d.id}/versions`)]);setFocusedDocument(detail);setDocumentVersions(v.versions)}},[callGateway,demoMode]);
+  const loadEdges=useCallback(async(id:string)=>{if(!demoMode)setEdges((await callGateway<{edges:KnowledgeEdge[]}>(`/v2/knowledge-edges?association_library_id=${id}`)).edges)},[callGateway,demoMode]);
+  const loadEdgeDocuments=useCallback(async()=>{if(!demoMode){const groups=await Promise.all(libraries.filter(l=>l.kind!=="association").map(l=>callGateway<{items:DocumentRecord[]}>(`/v2/documents?library_id=${l.id}&limit=100`)));setEdgeDocuments(groups.flatMap(g=>g.items))}},[callGateway,demoMode,libraries]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => void loadLibraries(), 0);
@@ -497,6 +507,7 @@ export function KnowledgeWorkbench({
     unclassified: libraries.reduce((sum, library) => sum + library.unclassified_count, 0),
     queued: jobs.filter((job) => job.state === "queued" || job.state === "running").length,
   }), [jobs, libraries]);
+  useEffect(()=>{if(activeLibrary.kind!=="association")return;const timer=window.setTimeout(()=>{void loadEdges(activeId);void loadEdgeDocuments()},0);return()=>window.clearTimeout(timer)},[activeId,activeLibrary.kind,loadEdges,loadEdgeDocuments]);
 
   function chooseLibrary(libraryId: string) {
     setActiveId(libraryId);
@@ -659,6 +670,11 @@ export function KnowledgeWorkbench({
       onNotice(error instanceof Error ? error.message : "文档保存失败");
     }
   }
+  async function saveDocumentDetails(){await updateFocusedDocument({title:documentDraft.title,owner:documentDraft.owner,metadata:JSON.parse(documentDraft.metadata)})}
+  async function saveLibrarySettings(e:FormEvent){e.preventDefault();await callGateway(`/v2/libraries/${activeId}`,{method:"PATCH",body:JSON.stringify(librarySettings)});setDialog(null);await loadLibraries()}
+  async function removeAlias(id:string){if(focusedDocument)setFocusedDocument(await callGateway<DocumentRecord>(`/v2/documents/${focusedDocument.id}/aliases/${id}`,{method:"DELETE"}))}
+  async function toggleTag(id:string){if(!focusedDocument)return;const ids=new Set(focusedDocument.tags.map(t=>t.id));if(ids.has(id))ids.delete(id);else ids.add(id);setFocusedDocument(await callGateway<DocumentRecord>(`/v2/documents/${focusedDocument.id}/tags`,{method:"PUT",body:JSON.stringify({tag_ids:[...ids]})}))}
+  async function activateDocumentVersion(id:string){if(focusedDocument){await callGateway(`/v2/documents/${focusedDocument.id}/versions/${id}:activate`,{method:"POST"});await focusDocument(focusedDocument)}}
 
   async function addAlias() {
     if (!focusedDocument || !aliasTarget) return;
@@ -814,6 +830,10 @@ export function KnowledgeWorkbench({
       setProposalAction("");
     }
   }
+  async function retargetProposalItem(id:string,target:string){if(proposal){await callGateway(`/v2/ai-proposals/${proposal.id}/items/${id}`,{method:"PATCH",body:JSON.stringify({target_node_id:target})});await loadProposal(proposal.id)}}
+  async function actOnJob(id:string,action:"retry"|"cancel"){await callGateway(`/v2/jobs/${id}:${action}`,{method:"POST"});await loadSideData(activeId)}
+  async function createKnowledgeEdge(e:FormEvent){e.preventDefault();await callGateway("/v2/knowledge-edges",{method:"POST",body:JSON.stringify({association_library_id:activeId,source_document_id:edgeDraft.source,target_document_id:edgeDraft.target,relation_type:edgeDraft.relation,confidence:Number(edgeDraft.confidence)})});await loadEdges(activeId)}
+  async function updateKnowledgeEdge(e:KnowledgeEdge,status:"confirmed"|"rejected"){await callGateway(`/v2/knowledge-edges/${e.id}`,{method:"PATCH",body:JSON.stringify({status,expected_revision:e.revision})});await loadEdges(activeId)}
 
   return <div className="page inner-page knowledge-page knowledge-v2">
     <div className="kb-title-row">
@@ -826,6 +846,7 @@ export function KnowledgeWorkbench({
         <span className={`control-plane-badge ${connectionError ? "is-error" : ""}`}><i/>{demoMode ? "演示数据" : connectionError ? "控制面离线" : "SQLite 控制面在线"}</span>
         <button className="outline-button" onClick={() => { setProposalPanelOpen(true); if (!proposal && proposals[0]) void loadProposal(proposals[0].id); }}>提案队列 · {proposals.length}</button>
         <button className="outline-button" onClick={() => void requestClassification()} disabled={proposalLoading}>{proposalLoading ? "生成中…" : "＋ 生成 AI 提案"}</button>
+        <button className="outline-button" onClick={()=>{setLibrarySettings({name:activeLibrary.name,description:activeLibrary.description,policy:activeLibrary.policy,status:activeLibrary.status});setDialog({type:"library-settings"})}}>库设置</button>
         <button className="primary-button compact" onClick={() => setDialog({ type: "library" })}>＋ 新建知识库</button>
       </div>
     </div>
@@ -838,8 +859,9 @@ export function KnowledgeWorkbench({
       <div><small>未归类</small><b>{overview.unclassified}</b><span>等待人工或提案</span></div>
       <div><small>活动任务</small><b>{overview.queued}</b><span>重启后可恢复</span></div>
     </section>
+    <nav className="deep-management-tabs"><button onClick={()=>setManagementView("browse")}>目录与文档</button><button onClick={()=>setManagementView("jobs")}>摄取任务</button><button onClick={()=>setManagementView("audit")}>审计记录</button><button disabled={activeLibrary.kind!=="association"} onClick={()=>setManagementView("associations")}>潜在关联</button></nav>
 
-    <section className="kb-workbench kb-workbench-v2">
+    {managementView==="browse"&&<section className="kb-workbench kb-workbench-v2">
       <aside className="library-rail" aria-label="知识库">
         <div className="rail-head"><span>LIBRARIES</span><button onClick={() => setDialog({ type: "library" })} title="新建知识库">＋</button></div>
         <div className="library-list">
@@ -882,6 +904,7 @@ export function KnowledgeWorkbench({
             <h2>{selectedNode?.name ?? activeLibrary.name}<small>{documents.length} 项</small></h2>
           </div>
           <div className="document-tools">
+            <select value={statusFilter} onChange={e=>setStatusFilter(e.target.value)}><option value="">全部状态</option><option value="unclassified">未归类</option><option value="active">有效</option><option value="archived">归档</option></select>
             <label className="document-search"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索当前目录及子目录"/></label>
             <button onClick={() => void refreshCurrent()} title="刷新">↻</button>
           </div>
@@ -908,7 +931,7 @@ export function KnowledgeWorkbench({
           <table className="document-table">
             <thead><tr><th className="check-cell"><input type="checkbox" aria-label="选择全部" checked={documents.length > 0 && selectedDocuments.size === documents.length} onChange={(event) => setSelectedDocuments(event.target.checked ? new Set(documents.map((document) => document.id)) : new Set())}/></th><th>名称</th><th>状态</th><th>主目录</th><th>标签</th><th>索引</th><th>更新时间</th></tr></thead>
             <tbody>
-              {documents.map((document) => <tr key={document.id} className={focusedDocument?.id === document.id ? "focused" : ""} onClick={() => setFocusedDocument(document)}>
+              {documents.map((document) => <tr key={document.id} className={focusedDocument?.id === document.id ? "focused" : ""} onClick={() => void focusDocument(document)}>
                 <td className="check-cell" onClick={(event) => event.stopPropagation()}><input type="checkbox" aria-label={`选择 ${document.title}`} checked={selectedDocuments.has(document.id)} onChange={(event) => setSelectedDocuments((current) => { const next = new Set(current); if (event.target.checked) next.add(document.id); else next.delete(document.id); return next; })}/></td>
                 <td><div className="document-name"><span>{document.mime_type.includes("pdf") ? "PDF" : document.mime_type.includes("json") ? "{}" : "MD"}</span><p><b>{document.title}</b><small>{document.source_name || document.source_path || "手动记录"}</small></p></div></td>
                 <td><span className={`status-pill status-${document.status}`}>{document.status === "unclassified" ? "未归类" : document.status === "active" ? "有效" : document.status === "archived" ? "归档" : "回收站"}</span></td>
@@ -936,8 +959,8 @@ export function KnowledgeWorkbench({
             <div><dt>版本</dt><dd>rev {focusedDocument.revision}</dd></div>
             <div><dt>内容哈希</dt><dd><code>{focusedDocument.content_hash || "尚未计算"}</code></dd></div>
           </dl>
-          <section className="drawer-section"><h3>标签</h3><div className="inspector-tags">{focusedDocument.tags.map((tag) => <span key={tag.id}>{tag.name}</span>)}{focusedDocument.tags.length === 0 && <small>尚无标签</small>}</div><div className="inline-editor"><input value={tagDraft} onChange={(event) => setTagDraft(event.target.value)} placeholder="输入或复用标签"/><button onClick={() => void createAndAssignTag()}>添加</button></div></section>
-          <section className="drawer-section"><h3>目录别名</h3><div className="alias-list">{focusedDocument.aliases.map((alias) => <span key={alias.id}>↗ {alias.name}</span>)}{focusedDocument.aliases.length === 0 && <small>没有跨目录引用</small>}</div><div className="inline-editor"><select value={aliasTarget} onChange={(event) => setAliasTarget(event.target.value)}><option value="">选择目录</option>{allNodes.filter((node) => node.kind === "physical" && node.id !== focusedDocument.primary_node_id).map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}</select><button onClick={() => void addAlias()} disabled={!aliasTarget}>引用</button></div></section>
+          <section className="drawer-section document-editor"><h3>属性与元数据</h3><input value={documentDraft.title} onChange={e=>setDocumentDraft({...documentDraft,title:e.target.value})}/><input value={documentDraft.owner} onChange={e=>setDocumentDraft({...documentDraft,owner:e.target.value})}/><textarea value={documentDraft.metadata} onChange={e=>setDocumentDraft({...documentDraft,metadata:e.target.value})}/><button onClick={()=>void saveDocumentDetails()}>保存</button></section><section className="drawer-section"><h3>标签</h3>{tags.map(t=><label key={t.id}><input type="checkbox" checked={focusedDocument.tags.some(x=>x.id===t.id)} onChange={()=>void toggleTag(t.id)}/>{t.name}</label>)}</section>
+          <section className="drawer-section"><h3>目录别名</h3>{focusedDocument.aliases.map(a=><span key={a.id}>{a.name}<button onClick={()=>void removeAlias(a.id)}>×</button></span>)}<div className="inline-editor"><select value={aliasTarget} onChange={e=>setAliasTarget(e.target.value)}><option value="">选择目录</option>{allNodes.filter(n=>n.kind==="physical").map(n=><option key={n.id} value={n.id}>{n.name}</option>)}</select><button onClick={()=>void addAlias()}>引用</button></div><div className="inline-editor"><input value={tagDraft} onChange={e=>setTagDraft(e.target.value)} placeholder="新标签"/><button onClick={()=>void createAndAssignTag()}>添加标签</button></div></section><section className="drawer-section"><h3>版本时间线</h3>{documentVersions.map(v=><article key={v.id}><b>v{v.version_number} · {v.index_status}</b>{focusedDocument.current_version_id===v.id?<strong>当前</strong>:v.index_status==="ready"&&<button onClick={()=>void activateDocumentVersion(v.id)}>切换</button>}</article>)}</section>
         </> : selectedNode ? <>
           <header><span className="section-kicker">NODE INSPECTOR</span><h2>{selectedNode.name}</h2><p>{selectedNode.description || "当前目录没有说明"}</p></header>
           <dl className="drawer-meta"><div><dt>节点 ID</dt><dd><code>{selectedNode.id}</code></dd></div><div><dt>直接文档</dt><dd>{selectedNode.direct_count}</dd></div><div><dt>子树文档</dt><dd>{selectedNode.subtree_count}</dd></div><div><dt>节点类型</dt><dd>{selectedNode.kind}</dd></div><div><dt>目录版本</dt><dd>v{treeVersion}</dd></div></dl>
@@ -945,14 +968,17 @@ export function KnowledgeWorkbench({
           <section className="drawer-section relation-preview"><h3>最近审计</h3>{audit.slice(0, 4).map((event) => <p key={event.id}><span>{formatTime(event.created_at)}</span>{event.action} · {event.target_type}</p>)}{audit.length === 0 && <small>暂无审计事件</small>}</section>
         </> : <div className="kb-empty">请选择一个目录或文档</div>}
       </aside>
-    </section>
+    </section>}
 
-    {activeLibrary.kind !== "association" && <section className="ingest-dock ingest-dock-v2">
+    {managementView==="browse"&&activeLibrary.kind !== "association" && <section className="ingest-dock ingest-dock-v2">
       <div><span className="section-kicker">PERSISTENT INGEST QUEUE</span><h2>摄取文件或扫描目录</h2><p>路径必须位于服务端 `RAG_INGEST_ROOTS` 允许范围。任务写入 SQLite，不再制造零向量知识块。</p></div>
       <label><span>WSL 文件或目录路径</span><input value={ingestPath} onChange={(event) => setIngestPath(event.target.value)}/></label>
       <label><span>目标目录</span><select value={selectedNodeId ?? ""} onChange={(event) => setSelectedNodeId(event.target.value)}>{allNodes.filter((node) => node.kind === "physical").map((node) => <option value={node.id} key={node.id}>{node.name}</option>)}</select></label>
       <button className="primary-button compact" onClick={() => void enqueueIngest()}>加入任务队列</button>
     </section>}
+    {managementView==="jobs"&&<section className="governance-panel"><h2>摄取任务中心</h2>{jobs.map(j=><article key={j.id}>{j.source_path} · {j.state} · {j.progress}% <button onClick={()=>void actOnJob(j.id,j.state==="queued"?"cancel":"retry")}>{j.state==="queued"?"取消":"重试"}</button><small>{j.error}</small></article>)}</section>}
+    {managementView==="audit"&&<section className="governance-panel"><h2>变更审计</h2>{audit.map(e=><article key={e.id}>{formatTime(e.created_at)} · {e.action} · {e.actor}</article>)}</section>}
+    {managementView==="associations"&&<section className="governance-panel"><h2>潜在关联治理</h2><form className="edge-composer" onSubmit={createKnowledgeEdge}><select value={edgeDraft.source} onChange={e=>setEdgeDraft({...edgeDraft,source:e.target.value})}>{edgeDocuments.map(d=><option key={d.id} value={d.id}>{d.title}</option>)}</select><select value={edgeDraft.target} onChange={e=>setEdgeDraft({...edgeDraft,target:e.target.value})}>{edgeDocuments.map(d=><option key={d.id} value={d.id}>{d.title}</option>)}</select><button>建立关联</button></form>{edges.map(e=><article key={e.id}>{e.source_title} ↔ {e.target_title}<button onClick={()=>void updateKnowledgeEdge(e,"confirmed")}>确认</button></article>)}</section>}
 
     {proposalPanelOpen && <div className="proposal-review-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setProposalPanelOpen(false); }}>
       <section className="proposal-review-panel" role="dialog" aria-modal="true" aria-label="AI 分类提案审核">
@@ -988,6 +1014,7 @@ export function KnowledgeWorkbench({
                       <p><span>{item.source_node_name || item.source_node_id}</span><i>→</i><strong>{item.target_node_name || item.target_node_id}</strong></p>
                       <small>{item.llm_reasoning || item.reason_code || "分类器未提供额外说明"}</small>
                       {versionConflict && <em>版本冲突：文档已在提案生成后更新，必须重新生成提案。</em>}
+                      {item.status==="pending"&&<select value={item.target_node_id} onChange={e=>void retargetProposalItem(item.id,e.target.value)}>{allNodes.filter(n=>n.kind==="physical"&&!n.is_unclassified).map(n=><option key={n.id} value={n.id}>{n.name}</option>)}</select>}
                     </div>
                     <div className="proposal-item-actions">
                       <i className={`proposal-status status-${item.status}`}>{item.status}</i>
@@ -1018,7 +1045,7 @@ export function KnowledgeWorkbench({
         <label><span>类型</span><select value={libraryDraft.kind} onChange={(event) => setLibraryDraft({ ...libraryDraft, kind: event.target.value })}><option value="document">文档库</option><option value="association">关联库</option></select></label>
         <label><span>用途说明</span><textarea value={libraryDraft.description} onChange={(event) => setLibraryDraft({ ...libraryDraft, description: event.target.value })}/></label>
         <footer><button type="button" onClick={() => setDialog(null)}>取消</button><button className="primary-button" type="submit">创建知识库</button></footer>
-      </form> : <form className="kb-modal" onSubmit={submitNode}>
+      </form> : dialog.type==="library-settings"?<form className="kb-modal" onSubmit={saveLibrarySettings}><h2>知识库设置</h2><input value={librarySettings.name} onChange={e=>setLibrarySettings({...librarySettings,name:e.target.value})}/><input value={librarySettings.policy} onChange={e=>setLibrarySettings({...librarySettings,policy:e.target.value})}/><textarea value={librarySettings.description} onChange={e=>setLibrarySettings({...librarySettings,description:e.target.value})}/><button>保存</button></form>: <form className="kb-modal" onSubmit={submitNode}>
         <header><div><span className="section-kicker">{dialog.type === "node" ? "NEW NODE" : "EDIT NODE"}</span><h2>{dialog.type === "node" ? "创建目录" : `编辑 ${dialog.node.name}`}</h2></div><button type="button" onClick={() => setDialog(null)}>×</button></header>
         <label><span>目录名称</span><input required value={nodeDraft.name} onChange={(event) => setNodeDraft({ ...nodeDraft, name: event.target.value })}/></label>
         <label><span>节点类型</span><select value={nodeDraft.kind} onChange={(event) => setNodeDraft({ ...nodeDraft, kind: event.target.value })}><option value="physical">实体目录</option><option value="smart">智能目录</option><option value="alias">目录快捷入口</option></select></label>

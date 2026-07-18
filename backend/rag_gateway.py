@@ -886,6 +886,11 @@ class V2IngestPathRequest(BaseModel):
     path: str = Field(min_length=1)
     library_id: str
     target_node_id: str
+class ProposalItemRetargetRequest(BaseModel): target_node_id:str
+class V2EdgeCreateRequest(BaseModel):
+    association_library_id:str;source_document_id:str;target_document_id:str;relation_type:str="related";confidence:float=Field(default=0,ge=0,le=1);note:str="";evidence:list=Field(default_factory=list)
+class V2EdgeUpdateRequest(BaseModel):
+    status:Optional[str]=None;relation_type:Optional[str]=None;confidence:Optional[float]=Field(default=None,ge=0,le=1);note:Optional[str]=None;evidence_json:Optional[list]=None;expected_revision:Optional[int]=None
 
 
 CONTROL_DB_PATH = os.environ.get(
@@ -1083,6 +1088,10 @@ async def v2_move_documents(
 @app.get("/v2/documents/{document_id}")
 async def v2_get_document(document_id: str):
     return knowledge_store.get_document(document_id)
+@app.get("/v2/documents/{document_id}/versions")
+async def v2_versions(document_id:str): knowledge_store.get_document(document_id);return {"versions":knowledge_store.list_versions(document_id)}
+@app.post("/v2/documents/{document_id}/versions/{version_id}:activate")
+async def v2_activate(document_id:str,version_id:str,_actor:str=Depends(require_management_auth)): return knowledge_store.rollback_version(document_id,version_id)
 
 
 @app.patch("/v2/documents/{document_id}")
@@ -1175,6 +1184,16 @@ async def v2_ingest_path(
 @app.get("/v2/jobs")
 async def v2_list_jobs(library_id: Optional[str] = None, limit: int = 50):
     return {"jobs": knowledge_store.list_jobs(library_id, limit)}
+@app.post("/v2/jobs/{job_id}:retry")
+async def v2_retry(job_id:str,_actor:str=Depends(require_management_auth)): return knowledge_store.retry_job(job_id)
+@app.post("/v2/jobs/{job_id}:cancel")
+async def v2_cancel(job_id:str,_actor:str=Depends(require_management_auth)): return knowledge_store.cancel_job(job_id)
+@app.get("/v2/knowledge-edges")
+async def v2_edges(association_library_id:str,status:Optional[str]=None,limit:int=100): return {"edges":knowledge_store.list_edges(association_library_id,status,limit)}
+@app.post("/v2/knowledge-edges",status_code=201)
+async def v2_edge_create(r:V2EdgeCreateRequest,actor:str=Depends(require_management_auth)): return knowledge_store.create_edge(r.association_library_id,r.source_document_id,r.target_document_id,r.relation_type,r.confidence,r.note,r.evidence,actor)
+@app.patch("/v2/knowledge-edges/{edge_id}")
+async def v2_edge_update(edge_id:str,r:V2EdgeUpdateRequest,actor:str=Depends(require_management_auth)): return knowledge_store.update_edge(edge_id,_model_fields(r,"expected_revision"),r.expected_revision,actor)
 
 
 @app.get("/v2/libraries/{library_id}/audit")
@@ -1543,6 +1562,8 @@ async def approve_proposal_item(
     except Exception as e:
         log.error(f"Approve item error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+@app.patch("/v2/ai-proposals/{proposal_id}/items/{item_id}")
+async def v2_retarget(proposal_id:str,item_id:str,r:ProposalItemRetargetRequest,_actor:str=Depends(require_management_auth)): return knowledge_store.retarget_proposal_item(proposal_id,item_id,r.target_node_id)
 
 
 @app.post("/v1/taxonomy/proposals/{proposal_id}/reject/{item_id}")

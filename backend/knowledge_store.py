@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 LIBRARY_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 MAX_JOB_RETRIES = 3
 DEFAULT_LEASE_SECONDS = 300
@@ -425,6 +425,17 @@ class KnowledgeStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_audit_library_time
                     ON audit_events(library_id, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS knowledge_edges (
+                    id TEXT PRIMARY KEY, association_library_id TEXT NOT NULL REFERENCES libraries(id),
+                    source_document_id TEXT NOT NULL REFERENCES documents(id), target_document_id TEXT NOT NULL REFERENCES documents(id),
+                    relation_type TEXT NOT NULL DEFAULT 'related', confidence REAL NOT NULL DEFAULT 0 CHECK(confidence BETWEEN 0 AND 1),
+                    status TEXT NOT NULL DEFAULT 'candidate' CHECK(status IN ('candidate','confirmed','rejected')),
+                    note TEXT NOT NULL DEFAULT '', evidence_json TEXT NOT NULL DEFAULT '[]', revision INTEGER NOT NULL DEFAULT 1,
+                    created_by TEXT NOT NULL DEFAULT 'local-owner', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    CHECK(source_document_id != target_document_id), UNIQUE(association_library_id,source_document_id,target_document_id,relation_type)
+                );
+                CREATE INDEX IF NOT EXISTS idx_edges_library_status ON knowledge_edges(association_library_id,status,updated_at DESC);
                 """
             )
                 self._migrate_schema(conn)
@@ -587,6 +598,16 @@ class KnowledgeStore:
                 "CREATE INDEX IF NOT EXISTS idx_proposal_items_unique_guard "
                 "ON proposal_items(proposal_id, document_id)"
             )
+        if current_version < 6:
+            conn.executescript("""CREATE TABLE IF NOT EXISTS knowledge_edges (
+                id TEXT PRIMARY KEY, association_library_id TEXT NOT NULL REFERENCES libraries(id),
+                source_document_id TEXT NOT NULL REFERENCES documents(id), target_document_id TEXT NOT NULL REFERENCES documents(id),
+                relation_type TEXT NOT NULL DEFAULT 'related', confidence REAL NOT NULL DEFAULT 0 CHECK(confidence BETWEEN 0 AND 1),
+                status TEXT NOT NULL DEFAULT 'candidate' CHECK(status IN ('candidate','confirmed','rejected')),
+                note TEXT NOT NULL DEFAULT '', evidence_json TEXT NOT NULL DEFAULT '[]', revision INTEGER NOT NULL DEFAULT 1,
+                created_by TEXT NOT NULL DEFAULT 'local-owner', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                CHECK(source_document_id != target_document_id), UNIQUE(association_library_id,source_document_id,target_document_id,relation_type));
+                CREATE INDEX IF NOT EXISTS idx_edges_library_status ON knowledge_edges(association_library_id,status,updated_at DESC);""")
 
     def _seed_defaults(self, conn: sqlite3.Connection) -> None:
         now = utc_now()
@@ -1566,6 +1587,24 @@ class KnowledgeStore:
             return [dict(row) for row in rows]
         finally:
             conn.close()
+    def retry_job(self, job_id: str) -> dict[str, Any]:
+        now=utc_now()
+        with self._transaction() as conn:
+            job=conn.execute("SELECT * FROM ingest_jobs WHERE id=?",(job_id,)).fetchone()
+            if job is None: raise StoreNotFound(f"job '{job_id}' not found")
+            if job["state"] not in {"failed","cancelled"}: raise StoreConflict("job is not retryable")
+            conn.execute("UPDATE ingest_jobs SET state='queued',progress=0,error='',retry_count=0,worker_id='',lease_until='',chunks_indexed=0,updated_at=? WHERE id=?",(now,job_id))
+            if job["document_id"]: conn.execute("UPDATE documents SET index_status='pending',revision=revision+1,updated_at=? WHERE id=?",(now,job["document_id"]))
+            if job["version_id"]: conn.execute("UPDATE document_versions SET index_status='pending' WHERE id=?",(job["version_id"],))
+            return dict(conn.execute("SELECT * FROM ingest_jobs WHERE id=?",(job_id,)).fetchone())
+    def cancel_job(self, job_id: str) -> dict[str, Any]:
+        with self._transaction() as conn:
+            job=conn.execute("SELECT * FROM ingest_jobs WHERE id=?",(job_id,)).fetchone()
+            if job is None: raise StoreNotFound(f"job '{job_id}' not found")
+            if job["state"]!="queued": raise StoreConflict("only queued jobs may be cancelled")
+            conn.execute("UPDATE ingest_jobs SET state='cancelled',error='cancelled by operator',updated_at=? WHERE id=?",(utc_now(),job_id))
+            if job["version_id"]: conn.execute("UPDATE document_versions SET index_status='failed' WHERE id=?",(job["version_id"],))
+            return dict(conn.execute("SELECT * FROM ingest_jobs WHERE id=?",(job_id,)).fetchone())
 
     def list_audit_events(self, library_id: str, limit: int = 50) -> list[dict[str, Any]]:
         conn = self._connect()
@@ -1991,9 +2030,37 @@ class KnowledgeStore:
         finally:
             conn.close()
 
-    # ------------------------------------------------------------------
+    def list_edges(self, association_library_id:str,status:str|None=None,limit:int=100)->list[dict[str,Any]]:
+        conn=self._connect()
+        try:
+            lib=self._require_library(conn,association_library_id)
+            if lib["kind"]!="association": raise StoreValidationError("association library required")
+            where,params="e.association_library_id=?",[association_library_id]
+            if status: where+=" AND e.status=?";params.append(status)
+            params.append(min(max(limit,1),500))
+            rows=conn.execute(f"SELECT e.*,s.title source_title,s.library_id source_library_id,t.title target_title,t.library_id target_library_id FROM knowledge_edges e JOIN documents s ON s.id=e.source_document_id JOIN documents t ON t.id=e.target_document_id WHERE {where} ORDER BY e.updated_at DESC LIMIT ?",params).fetchall()
+            return [dict(r) for r in rows]
+        finally: conn.close()
+    def create_edge(self,association_library_id:str,source_document_id:str,target_document_id:str,relation_type:str="related",confidence:float=0,note:str="",evidence:list|None=None,actor:str="local-owner")->dict[str,Any]:
+        if relation_type not in {"supports","conflicts","causes","analogous","qualifies","related"} or source_document_id==target_document_id or not 0<=confidence<=1: raise StoreValidationError("invalid edge")
+        with self._transaction() as conn:
+            lib=self._require_library(conn,association_library_id);source=self._require_document(conn,source_document_id);target=self._require_document(conn,target_document_id)
+            if lib["kind"]!="association" or source["library_id"]==target["library_id"]: raise StoreValidationError("edge must connect different libraries")
+            edge_id,now=new_id("edge"),utc_now()
+            try: conn.execute("INSERT INTO knowledge_edges(id,association_library_id,source_document_id,target_document_id,relation_type,confidence,status,note,evidence_json,revision,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,'candidate',?,?,1,?,?,?)",(edge_id,association_library_id,source_document_id,target_document_id,relation_type,confidence,note,json.dumps(evidence or []),actor,now,now))
+            except sqlite3.IntegrityError as exc: raise StoreConflict("equivalent edge exists") from exc
+            return dict(conn.execute("SELECT * FROM knowledge_edges WHERE id=?",(edge_id,)).fetchone())
+    def update_edge(self,edge_id:str,fields:dict[str,Any],expected_revision:int|None=None,actor:str="local-owner")->dict[str,Any]:
+        changes={k:v for k,v in fields.items() if k in {"relation_type","confidence","status","note","evidence_json"}}
+        if not changes: raise StoreValidationError("no supported fields")
+        with self._transaction() as conn:
+            row=conn.execute("SELECT * FROM knowledge_edges WHERE id=?",(edge_id,)).fetchone()
+            if row is None: raise StoreNotFound("edge not found")
+            if expected_revision is not None and row["revision"]!=expected_revision: raise StoreConflict("edge revision changed")
+            assignments=",".join(f"{k}=?" for k in changes);conn.execute(f"UPDATE knowledge_edges SET {assignments},revision=revision+1,updated_at=? WHERE id=?",[*changes.values(),utc_now(),edge_id])
+            return dict(conn.execute("SELECT * FROM knowledge_edges WHERE id=?",(edge_id,)).fetchone())
+
     # Classification Proposals
-    # ------------------------------------------------------------------
 
     def create_proposal(
         self,
@@ -2318,6 +2385,12 @@ class KnowledgeStore:
             return dict(conn.execute(
                 "SELECT * FROM proposal_items WHERE id = ?", (item_id,)
             ).fetchone())
+    def retarget_proposal_item(self,proposal_id:str,item_id:str,target_node_id:str)->dict[str,Any]:
+        with self._transaction() as conn:
+            item=self._require_proposal_item(conn,proposal_id,item_id);doc=self._require_document(conn,item["document_id"]);target=conn.execute("SELECT * FROM taxonomy_nodes WHERE id=?",(target_node_id,)).fetchone()
+            if item["status"] not in {"pending","approved"} or target is None or target["library_id"]!=doc["library_id"] or target["kind"]!="physical" or target["is_unclassified"] or target["locked"]: raise StoreValidationError("invalid target")
+            now=utc_now();conn.execute("UPDATE proposal_items SET target_node_id=?,status='pending',reason_code='MANUAL_RETARGET',reviewed_at='',updated_at=? WHERE id=?",(target_node_id,now,item_id));conn.execute("UPDATE classification_proposals SET status='reviewing',updated_at=? WHERE id=?",(now,proposal_id))
+            return dict(conn.execute("SELECT * FROM proposal_items WHERE id=?",(item_id,)).fetchone())
 
     def reject_proposal_item(
         self, proposal_id: str, item_id: str, reason: str = ""
