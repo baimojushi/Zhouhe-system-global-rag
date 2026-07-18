@@ -27,6 +27,7 @@ import logging
 import argparse
 import hashlib
 import hmac
+import json
 import mimetypes
 from pathlib import Path
 from datetime import datetime, timezone
@@ -165,26 +166,31 @@ def get_active_version_ids(library_id: str = None) -> list[str]:
     """Get list of active version_ids, optionally filtered by library."""
     if knowledge_store is None:
         return []
+    conn = None
     try:
         conn = knowledge_store._connect()
         if library_id:
             rows = conn.execute(
                 """SELECT dv.id FROM document_versions dv
                    JOIN documents d ON d.current_version_id = dv.id
-                   WHERE d.library_id = ? AND d.current_version_id IS NOT NULL""",
+                   WHERE d.library_id = ? AND d.current_version_id IS NOT NULL
+                     AND d.index_status = 'ready' AND dv.index_status = 'ready'""",
                 (library_id,)
             ).fetchall()
         else:
             rows = conn.execute(
                 """SELECT dv.id FROM document_versions dv
                    JOIN documents d ON d.current_version_id = dv.id
-                   WHERE d.current_version_id IS NOT NULL"""
+                   WHERE d.current_version_id IS NOT NULL
+                     AND d.index_status = 'ready' AND dv.index_status = 'ready'"""
             ).fetchall()
-        conn.close()
         return [row["id"] for row in rows]
     except Exception as e:
         log.warning(f"Failed to get active version ids: {e}")
         return []
+    finally:
+        if conn is not None:
+            conn.close()
 
 def hybrid_search(query: str, top_k: int = 5, alpha: float = 0.55,
                   collection=None, filters: dict = None,
@@ -217,23 +223,41 @@ def hybrid_search(query: str, top_k: int = 5, alpha: float = 0.55,
             wvc.query.Filter.by_property("library_id").equal(library_id)
         )
 
-    # Add active version filter
+    # Keep normal requests compact.  Once the active-version set becomes large,
+    # sending every ID to Weaviate on every query creates an unbounded filter
+    # payload.  In that case we over-fetch and enforce the version lock locally.
+    active_version_set: set[str] | None = None
+    active_filter_threshold = int(os.environ.get("RAG_ACTIVE_FILTER_THRESHOLD", "256"))
     if active_versions_only:
         active_versions = get_active_version_ids(library_id)
-        if active_versions:
+        if not active_versions:
+            return []
+        if len(active_versions) <= active_filter_threshold:
             weaviate_filters.append(
                 wvc.query.Filter.by_property("version_id").contains_any(active_versions)
             )
-        elif library_id:
-            # No active versions in this library, return empty
-            return []
+        else:
+            active_version_set = set(active_versions)
+            log.info(
+                "Using local active-version post-filter (%d versions, library=%s)",
+                len(active_versions), library_id or "all",
+            )
 
     if collection is None:
-        collection = knowledge_coll
+        if library_id:
+            try:
+                from ingest_worker import get_library_collection
+                lib_map = {lib["id"]: lib["collection_name"] for lib in DEFAULT_LIBRARIES}
+                coll_name = lib_map.get(library_id, f"kb_{library_id}_v1")
+                collection = get_library_collection(library_id, coll_name)
+            except Exception:
+                collection = knowledge_coll
+        else:
+            collection = knowledge_coll
 
     kwargs = {
         "query": query,
-        "limit": top_k,
+        "limit": min(max(top_k * 10, 50), 500) if active_version_set else top_k,
         "alpha": alpha,
         "vector": query_vec,
     }
@@ -244,6 +268,9 @@ def hybrid_search(query: str, top_k: int = 5, alpha: float = 0.55,
 
     results = []
     for obj in result.objects:
+        version_id = obj.properties.get("version_id", "")
+        if active_version_set is not None and version_id not in active_version_set:
+            continue
         item = {
             "chunk_id": obj.properties.get("chunk_id"),
             "content": obj.properties.get("content", ""),
@@ -254,10 +281,12 @@ def hybrid_search(query: str, top_k: int = 5, alpha: float = 0.55,
             "page": obj.properties.get("page", 0),
             "scope": obj.properties.get("scope", ""),
             "mime_type": obj.properties.get("mime_type", ""),
-            "version_id": obj.properties.get("version_id", ""),
+            "version_id": version_id,
             "document_id": obj.properties.get("document_id", ""),
         }
         results.append(item)
+        if len(results) >= top_k:
+            break
     return results
 
 def bm25_search(query: str, top_k: int = 5, scope: str = "global",
@@ -1229,7 +1258,11 @@ async def ingest_path(request: IngestPathRequest):
 
 
 @app.post("/v1/taxonomy/proposals")
-async def create_taxonomy_proposal(request: TaxonomyProposalRequest):
+@app.post("/v2/ai-proposals")
+async def create_taxonomy_proposal(
+    request: TaxonomyProposalRequest,
+    actor: str = Depends(require_management_auth),
+):
     """Generate an AI-powered taxonomy classification proposal (V2 persistent).
 
     Workflow:
@@ -1277,6 +1310,8 @@ async def create_taxonomy_proposal(request: TaxonomyProposalRequest):
                 signals.append("general")
 
             routing_cards.append({
+                # Keep both names for old prompts and the V2 control-plane API.
+                "file_id": doc["id"],
                 "document_id": doc["id"],
                 "title": title,
                 "mime": doc["mime_type"],
@@ -1284,10 +1319,30 @@ async def create_taxonomy_proposal(request: TaxonomyProposalRequest):
                 "summary": title,
                 "signals": signals,
                 "content_hash": doc["content_hash"],
+                "source_node_id": doc.get("primary_node_id", ""),
             })
 
         # Step 3: Load subtree
-        subtree = PREDEFINED_TREES.get(request.library_id, [])
+        live_tree = knowledge_store.get_tree(request.library_id)
+
+        def compact_nodes(nodes: list[dict]) -> list[dict]:
+            compact = []
+            for node in nodes:
+                if node.get("is_unclassified") or node.get("kind") != "physical":
+                    continue
+                item = {
+                    "node_id": node["id"],
+                    "name": node["name"],
+                }
+                if node.get("description"):
+                    item["description"] = node["description"]
+                children = compact_nodes(node.get("children", []))
+                if children:
+                    item["children"] = children
+                compact.append(item)
+            return compact
+
+        subtree = compact_nodes(live_tree["tree"])
         subtree_json = json.dumps(subtree, ensure_ascii=False, indent=2)
 
         # Step 4: Call LLM
@@ -1319,17 +1374,31 @@ async def create_taxonomy_proposal(request: TaxonomyProposalRequest):
             subtree=subtree,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
+            created_by=actor,
         )
 
         # Step 6: Add proposal items
         operations = llm_response.get("operations", [])
         items = []
+        validation_errors = []
+        documents_by_id = {doc["id"]: doc for doc in docs["items"]}
         for op in operations:
             try:
+                document_id = op.get("document_id") or op.get("file_id") or ""
+                document = documents_by_id.get(document_id)
+                if document is None:
+                    raise StoreValidationError(
+                        f"classifier returned unknown document_id '{document_id}'"
+                    )
+                source_node_id = document.get("primary_node_id") or ""
+                if not source_node_id:
+                    raise StoreConflict(
+                        f"document '{document_id}' has no primary placement"
+                    )
                 item = knowledge_store.add_proposal_item(
                     proposal_id=proposal["id"],
-                    document_id=op["file_id"].replace("file-", "doc-") if op["file_id"].startswith("file-") else op.get("document_id", ""),
-                    source_node_id=request.source_node if request.source_node != "unclassified" else f"{request.library_id[:2]}-unclassified",
+                    document_id=document_id,
+                    source_node_id=source_node_id,
                     target_node_id=op["target_node_id"],
                     confidence=op.get("confidence", 0.0),
                     reason_code=op.get("reason_code", ""),
@@ -1338,6 +1407,11 @@ async def create_taxonomy_proposal(request: TaxonomyProposalRequest):
                 items.append(item)
             except Exception as item_err:
                 log.warning(f"Failed to add proposal item: {item_err}")
+                validation_errors.append({
+                    "document_id": op.get("document_id") or op.get("file_id") or "",
+                    "target_node_id": op.get("target_node_id", ""),
+                    "message": str(item_err),
+                })
 
         return {
             "status": "preview",
@@ -1345,8 +1419,15 @@ async def create_taxonomy_proposal(request: TaxonomyProposalRequest):
             "items": items,
             "routing_cards_count": len(routing_cards),
             "llm_model": llm_model,
+            "validation_errors": validation_errors,
         }
 
+    except StoreNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except StoreValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except StoreConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         log.error(f"Taxonomy proposal error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -1380,6 +1461,7 @@ def _rule_based_classify(routing_cards: list[dict], library_id: str) -> dict:
             operations.append({
                 "op": "move",
                 "file_id": card["file_id"],
+                "document_id": card["document_id"],
                 "target_node_id": best_match,
                 "confidence": round(confidence, 2),
                 "reason_code": "SIGNAL_MATCH",
@@ -1388,6 +1470,7 @@ def _rule_based_classify(routing_cards: list[dict], library_id: str) -> dict:
             operations.append({
                 "op": "move",
                 "file_id": card["file_id"],
+                "document_id": card["document_id"],
                 "target_node_id": best_match,
                 "confidence": round(confidence, 2),
                 "reason_code": "SIGNAL_MATCH",
@@ -1395,6 +1478,7 @@ def _rule_based_classify(routing_cards: list[dict], library_id: str) -> dict:
         else:
             holds.append({
                 "file_id": card["file_id"],
+                "document_id": card["document_id"],
                 "confidence": round(confidence, 2),
                 "reason_code": "LOW_CONFIDENCE",
             })
@@ -1408,6 +1492,7 @@ def _rule_based_classify(routing_cards: list[dict], library_id: str) -> dict:
 
 
 @app.get("/v1/taxonomy/proposals")
+@app.get("/v2/ai-proposals")
 async def list_taxonomy_proposals(library_id: Optional[str] = None, status: Optional[str] = None, limit: int = 50):
     """List classification proposals."""
     if knowledge_store is None:
@@ -1421,6 +1506,7 @@ async def list_taxonomy_proposals(library_id: Optional[str] = None, status: Opti
 
 
 @app.get("/v1/taxonomy/proposals/{proposal_id}")
+@app.get("/v2/ai-proposals/{proposal_id}")
 async def get_taxonomy_proposal(proposal_id: str):
     """Get a taxonomy proposal with its items."""
     if knowledge_store is None:
@@ -1436,42 +1522,62 @@ async def get_taxonomy_proposal(proposal_id: str):
 
 
 @app.post("/v1/taxonomy/proposals/{proposal_id}/approve/{item_id}")
-async def approve_proposal_item(proposal_id: str, item_id: str):
+@app.post("/v2/ai-proposals/{proposal_id}/items/{item_id}/approve")
+async def approve_proposal_item(
+    proposal_id: str,
+    item_id: str,
+    _actor: str = Depends(require_management_auth),
+):
     """Approve a proposal item."""
     if knowledge_store is None:
         raise HTTPException(status_code=503, detail="Knowledge store not initialized")
     try:
-        item = knowledge_store.approve_proposal_item(item_id)
+        item = knowledge_store.approve_proposal_item(proposal_id, item_id)
         return {"status": "approved", "item": item}
     except StoreNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
     except StoreValidationError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except StoreConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         log.error(f"Approve item error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/v1/taxonomy/proposals/{proposal_id}/reject/{item_id}")
-async def reject_proposal_item(proposal_id: str, item_id: str, request: ProposalItemActionRequest = None):
+@app.post("/v2/ai-proposals/{proposal_id}/items/{item_id}/reject")
+async def reject_proposal_item(
+    proposal_id: str,
+    item_id: str,
+    request: ProposalItemActionRequest = None,
+    _actor: str = Depends(require_management_auth),
+):
     """Reject a proposal item."""
     if knowledge_store is None:
         raise HTTPException(status_code=503, detail="Knowledge store not initialized")
     try:
         reason = request.reason if request else ""
-        item = knowledge_store.reject_proposal_item(item_id, reason=reason)
+        item = knowledge_store.reject_proposal_item(proposal_id, item_id, reason=reason)
         return {"status": "rejected", "item": item}
     except StoreNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
     except StoreValidationError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except StoreConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         log.error(f"Reject item error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/v1/taxonomy/proposals/{proposal_id}/apply")
-async def apply_taxonomy_proposal(proposal_id: str, request: TaxonomyProposalApplyRequest = None):
+@app.post("/v2/ai-proposals/{proposal_id}/apply")
+async def apply_taxonomy_proposal(
+    proposal_id: str,
+    request: TaxonomyProposalApplyRequest = None,
+    _actor: str = Depends(require_management_auth),
+):
     """Apply all approved items in a proposal."""
     if knowledge_store is None:
         raise HTTPException(status_code=503, detail="Knowledge store not initialized")
@@ -1480,13 +1586,21 @@ async def apply_taxonomy_proposal(proposal_id: str, request: TaxonomyProposalApp
         return result
     except StoreNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except StoreValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except StoreConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         log.error(f"Apply proposal error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/v1/taxonomy/proposals/{proposal_id}/revert")
-async def revert_taxonomy_proposal(proposal_id: str):
+@app.post("/v2/ai-proposals/{proposal_id}/revert")
+async def revert_taxonomy_proposal(
+    proposal_id: str,
+    _actor: str = Depends(require_management_auth),
+):
     """Revert all applied items in a proposal."""
     if knowledge_store is None:
         raise HTTPException(status_code=503, detail="Knowledge store not initialized")
@@ -1495,6 +1609,8 @@ async def revert_taxonomy_proposal(proposal_id: str):
         return result
     except StoreNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except StoreConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         log.error(f"Revert proposal error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

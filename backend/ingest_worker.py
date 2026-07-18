@@ -35,7 +35,7 @@ import weaviate
 from weaviate.auth import AuthApiKey
 from FlagEmbedding import FlagModel
 
-from knowledge_store import KnowledgeStore, DEFAULT_LIBRARIES
+from knowledge_store import KnowledgeStore, StoreConflict
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -160,7 +160,7 @@ CHUNK_OVERLAP = 80
 
 def read_source_file(path: str) -> str:
     """Read file content with encoding detection."""
-    p = Path(path)
+    p = Path(path).expanduser().resolve(strict=True)
     if not p.exists():
         raise FileNotFoundError(f"source file not found: {path}")
     if not p.is_file():
@@ -169,10 +169,11 @@ def read_source_file(path: str) -> str:
     allowed = False
     for root in INGEST_ROOTS:
         try:
-            p.relative_to(root)
+            resolved_root = root.expanduser().resolve(strict=True)
+            p.relative_to(resolved_root)
             allowed = True
             break
-        except ValueError:
+        except (FileNotFoundError, ValueError):
             continue
     if not allowed:
         raise ValueError(f"source path outside RAG_INGEST_ROOTS: {path}")
@@ -217,18 +218,8 @@ def process_job(job: dict[str, Any], store: KnowledgeStore) -> tuple[int, str]:
         job["id"], library_id, target_node_id, source_path, version_id,
     )
 
-    library = next(
-        (lib for lib in DEFAULT_LIBRARIES if lib["id"] == library_id), None
-    )
-    if library is None:
-        lib_row = store._connect().execute(
-            "SELECT * FROM libraries WHERE id = ?", (library_id,)
-        ).fetchone()
-        if lib_row is None:
-            raise ValueError(f"library '{library_id}' not found")
-        collection_name = lib_row["collection_name"]
-    else:
-        collection_name = library["collection_name"]
+    library = store.get_library(library_id)
+    collection_name = library["collection_name"]
 
     collection = get_library_collection(library_id, collection_name)
 
@@ -240,19 +231,6 @@ def process_job(job: dict[str, Any], store: KnowledgeStore) -> tuple[int, str]:
         mime_type = "text/x-python"
     elif source_name.endswith(".md"):
         mime_type = "text/markdown"
-
-    # Update version with content hash and size
-    if version_id:
-        try:
-            conn = store._connect()
-            conn.execute(
-                """UPDATE document_versions SET content_hash = ?, size_bytes = ?
-                   WHERE id = ?""",
-                (file_hash[:16], len(content.encode("utf-8")), version_id),
-            )
-            conn.close()
-        except Exception as e:
-            log.warning("Failed to update version metadata: %s", e)
 
     chunks = chunk_text(content)
     if not chunks:
@@ -266,7 +244,7 @@ def process_job(job: dict[str, Any], store: KnowledgeStore) -> tuple[int, str]:
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     batch = []
     for idx, (chunk, vec) in enumerate(zip(chunks, vectors)):
-        chunk_id = f"{document_id or 'doc'}-{file_hash[:8]}-{idx}"
+        chunk_id = f"{version_id or document_id or file_hash[:16]}-{idx}"
         batch.append(weaviate.classes.data.DataObject(
             properties={
                 "chunk_id": chunk_id,
@@ -287,6 +265,7 @@ def process_job(job: dict[str, Any], store: KnowledgeStore) -> tuple[int, str]:
                 "node_id": target_node_id,
             },
             vector=vec,
+            uuid=str(uuid.uuid5(uuid.NAMESPACE_URL, f"global-rag:{chunk_id}")),
         ))
 
     collection.data.insert_many(batch)
@@ -298,20 +277,29 @@ def process_job(job: dict[str, Any], store: KnowledgeStore) -> tuple[int, str]:
 # Worker main loop
 # ---------------------------------------------------------------------------
 
-def heartbeat_loop(store: KnowledgeStore, job_id: str, lease_seconds: int) -> None:
+def heartbeat_loop(
+    store: KnowledgeStore,
+    job_id: str,
+    lease_seconds: int,
+    stop_event: threading.Event,
+    lease_lost: threading.Event,
+) -> None:
     """Renew lease periodically until job completes or shutdown."""
     interval = max(lease_seconds // 3, 10)
-    while not _shutdown.is_set():
-        _shutdown.wait(interval)
-        if _shutdown.is_set():
+    while not _shutdown.is_set() and not stop_event.is_set():
+        stop_event.wait(interval)
+        if _shutdown.is_set() or stop_event.is_set():
             break
         try:
             ok = store.renew_lease(job_id, _worker_id, lease_seconds)
             if not ok:
                 log.warning("Heartbeat failed for job %s (lease lost)", job_id)
+                lease_lost.set()
                 break
         except Exception as exc:
             log.error("Heartbeat error for job %s: %s", job_id, exc)
+            lease_lost.set()
+            break
 
 
 def run_worker(
@@ -338,38 +326,35 @@ def run_worker(
             _shutdown.wait(poll_interval)
             continue
 
+        heartbeat_stop = threading.Event()
+        lease_lost = threading.Event()
         hb_thread = threading.Thread(
-            target=heartbeat_loop, args=(store, job["id"], lease_seconds),
+            target=heartbeat_loop,
+            args=(store, job["id"], lease_seconds, heartbeat_stop, lease_lost),
             daemon=True,
         )
         hb_thread.start()
 
         try:
             chunks, collection_name = process_job(job, store)
-            version_id = job.get("version_id") or ""
-
-            # Complete the version
-            if version_id:
-                store.complete_version(version_id, chunks, collection_name)
-                # Atomically activate this version
-                store.activate_version(version_id)
-                log.info("Version %s activated with %d chunks", version_id, chunks)
-
-            # Complete the job
-            store.complete_job(job["id"], chunks_indexed=chunks)
+            if lease_lost.is_set():
+                raise StoreConflict(
+                    f"job '{job['id']}' lost its lease before activation"
+                )
+            store.finalize_ingest_job(
+                job["id"], _worker_id, chunks, collection_name
+            )
             log.info("Job %s completed: %d chunks indexed", job["id"], chunks)
         except Exception as exc:
             log.error("Job %s failed: %s", job["id"], exc, exc_info=True)
-            version_id = job.get("version_id") or ""
-            if version_id:
+            if not lease_lost.is_set():
                 try:
-                    store.fail_version(version_id, str(exc))
-                except Exception as ver_exc:
-                    log.error("Failed to mark version as failed: %s", ver_exc)
-            try:
-                store.fail_job(job["id"], str(exc))
-            except Exception as fail_exc:
-                log.error("Failed to record job failure: %s", fail_exc)
+                    store.fail_job(job["id"], _worker_id, str(exc))
+                except Exception as fail_exc:
+                    log.error("Failed to record job failure: %s", fail_exc)
+        finally:
+            heartbeat_stop.set()
+            hb_thread.join(timeout=1)
 
         if run_once:
             break

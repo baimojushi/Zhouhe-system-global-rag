@@ -1,5 +1,7 @@
 # Knowledge Workbench V2 第一阶段落地报告
 
+> 本文是第一阶段历史报告。Worker、版本链和 AI 提案第三阶段现已完成并在 Schema V5 加固，当前升级说明以 `SCHEMA_V5_HARDENING_REPORT_20260718.md` 为准。
+
 ## 本轮交付范围
 
 本轮实现 V2 的“手动管理基础闭环”，没有宣称完成后续 AI 目录治理和潜在关联推理：
@@ -50,7 +52,7 @@
 
 验证环境本身无法读取进程 RSS，原生 `process.memoryUsage()` 会抛出 `uv_resident_set_memory`。构建验证时仅通过临时运行时覆盖规避该容器限制，覆盖文件没有进入交付源码。此问题不是项目代码或 Windows/WSL 部署问题。
 
-## 尚未完成
+## 第一阶段结束时尚未完成
 
 - 摄取 Worker 消费 V2 Job 并按库写入独立 Weaviate Collection。
 - Document Version 的内容替换、解析和原子索引切换。

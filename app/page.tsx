@@ -481,11 +481,6 @@ export default function Home() {
     }
   }
 
-  function restartPillLabel(service: string): string {
-    const map: Record<string, string> = { gateway: "网关", weaviate: "Weaviate", llm: "Gemma" };
-    return map[service] || service;
-  }
-
   function toggleCitation(id: string) {
     setSelected((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
     flash(selected.includes(id) ? "已移出引用" : "已加入回答上下文");

@@ -9,9 +9,11 @@
     "dev": "next dev --hostname 127.0.0.1 --port 3000",
     "dev:lan": "next dev --hostname 0.0.0.0 --port 3000",
     "dev:webpack": "next dev --webpack --hostname 127.0.0.1 --port 3000",
-    "build": "next build",
+    "build": "next build --webpack",
     "start": "node scripts/start-local.mjs",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern .test-work",
+    "typecheck": "tsc --noEmit --pretty false",
+    "test:backend": "python3 -m unittest backend/test_knowledge_store.py -v",
     "verify:ui": "node scripts/verify-ui.mjs"
   },
   "dependencies": {

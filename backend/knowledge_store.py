@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 LIBRARY_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 MAX_JOB_RETRIES = 3
 DEFAULT_LEASE_SECONDS = 300
@@ -376,6 +376,8 @@ class KnowledgeStore:
                     prompt_tokens INTEGER NOT NULL DEFAULT 0,
                     completion_tokens INTEGER NOT NULL DEFAULT 0,
                     created_by TEXT NOT NULL DEFAULT 'auto-classifier',
+                    applied_at TEXT NOT NULL DEFAULT '',
+                    reverted_at TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -394,6 +396,11 @@ class KnowledgeStore:
                     reason_code TEXT NOT NULL DEFAULT '',
                     llm_reasoning TEXT NOT NULL DEFAULT '',
                     previous_node_id TEXT NOT NULL DEFAULT '',
+                    previous_document_status TEXT NOT NULL DEFAULT 'unclassified',
+                    base_document_revision INTEGER NOT NULL DEFAULT 0,
+                    applied_document_revision INTEGER NOT NULL DEFAULT 0,
+                    reviewed_at TEXT NOT NULL DEFAULT '',
+                    conflict_reason TEXT NOT NULL DEFAULT '',
                     applied_at TEXT NOT NULL DEFAULT '',
                     reverted_at TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
@@ -495,7 +502,9 @@ class KnowledgeStore:
                 "CREATE INDEX IF NOT EXISTS idx_versions_document ON document_versions(document_id, version_number DESC)"
             )
 
-        # V4: Add classification proposals tables (idempotent CREATE IF NOT EXISTS)
+        # V4: Add classification proposals tables (idempotent CREATE IF NOT EXISTS).
+        # Some early V4 builds created these tables while still reporting schema
+        # version 3, therefore the migration must remain safe to run repeatedly.
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS classification_proposals (
                 id TEXT PRIMARY KEY,
@@ -508,6 +517,8 @@ class KnowledgeStore:
                 prompt_tokens INTEGER NOT NULL DEFAULT 0,
                 completion_tokens INTEGER NOT NULL DEFAULT 0,
                 created_by TEXT NOT NULL DEFAULT 'auto-classifier',
+                applied_at TEXT NOT NULL DEFAULT '',
+                reverted_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -526,6 +537,11 @@ class KnowledgeStore:
                 reason_code TEXT NOT NULL DEFAULT '',
                 llm_reasoning TEXT NOT NULL DEFAULT '',
                 previous_node_id TEXT NOT NULL DEFAULT '',
+                previous_document_status TEXT NOT NULL DEFAULT 'unclassified',
+                base_document_revision INTEGER NOT NULL DEFAULT 0,
+                applied_document_revision INTEGER NOT NULL DEFAULT 0,
+                reviewed_at TEXT NOT NULL DEFAULT '',
+                conflict_reason TEXT NOT NULL DEFAULT '',
                 applied_at TEXT NOT NULL DEFAULT '',
                 reverted_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
@@ -536,6 +552,41 @@ class KnowledgeStore:
             CREATE INDEX IF NOT EXISTS idx_proposal_items_document
                 ON proposal_items(document_id);
         """)
+
+        if current_version < 5:
+            proposal_columns = {
+                col["name"] for col in conn.execute(
+                    "PRAGMA table_info(classification_proposals)"
+                ).fetchall()
+            }
+            for name in ("applied_at", "reverted_at"):
+                if name not in proposal_columns:
+                    conn.execute(
+                        f"ALTER TABLE classification_proposals "
+                        f"ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
+                    )
+
+            item_columns = {
+                col["name"] for col in conn.execute(
+                    "PRAGMA table_info(proposal_items)"
+                ).fetchall()
+            }
+            v5_item_columns = {
+                "previous_document_status": "TEXT NOT NULL DEFAULT 'unclassified'",
+                "base_document_revision": "INTEGER NOT NULL DEFAULT 0",
+                "applied_document_revision": "INTEGER NOT NULL DEFAULT 0",
+                "reviewed_at": "TEXT NOT NULL DEFAULT ''",
+                "conflict_reason": "TEXT NOT NULL DEFAULT ''",
+            }
+            for name, declaration in v5_item_columns.items():
+                if name not in item_columns:
+                    conn.execute(
+                        f"ALTER TABLE proposal_items ADD COLUMN {name} {declaration}"
+                    )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_proposal_items_unique_guard "
+                "ON proposal_items(proposal_id, document_id)"
+            )
 
     def _seed_defaults(self, conn: sqlite3.Connection) -> None:
         now = utc_now()
@@ -682,6 +733,15 @@ class KnowledgeStore:
                     ORDER BY l.created_at, l.id"""
             ).fetchall()
             return [self._library_payload(row) for row in rows]
+        finally:
+            conn.close()
+
+    def get_library(self, library_id: str) -> dict[str, Any]:
+        """Return one library without exposing a raw SQLite connection."""
+        conn = self._connect()
+        try:
+            row = self._require_library(conn, library_id)
+            return self._library_payload(row)
         finally:
             conn.close()
 
@@ -1539,16 +1599,36 @@ class KnowledgeStore:
     # ------------------------------------------------------------------
 
     def release_expired_leases(self) -> int:
-        """Reclaim jobs whose lease has expired back to queued state."""
+        """Reclaim expired leases and count them against the retry budget."""
         now = utc_now()
         with self._transaction() as conn:
-            result = conn.execute(
-                """UPDATE ingest_jobs SET state = 'queued', worker_id = '',
-                   lease_until = '', updated_at = ?
-                   WHERE state = 'running' AND lease_until != '' AND lease_until < ?""",
-                (now, now),
-            )
-            return result.rowcount
+            expired = conn.execute(
+                """SELECT * FROM ingest_jobs WHERE state = 'running'
+                   AND lease_until != '' AND lease_until < ?""",
+                (now,),
+            ).fetchall()
+            for job in expired:
+                retry_count = job["retry_count"] + 1
+                state = "failed" if retry_count >= job["max_retries"] else "queued"
+                conn.execute(
+                    """UPDATE ingest_jobs SET state = ?, retry_count = ?,
+                       error = 'worker lease expired', worker_id = '',
+                       lease_until = '', updated_at = ? WHERE id = ?""",
+                    (state, retry_count, now, job["id"]),
+                )
+                index_status = "failed" if state == "failed" else "pending"
+                if job["document_id"]:
+                    conn.execute(
+                        """UPDATE documents SET index_status = ?,
+                           revision = revision + 1, updated_at = ? WHERE id = ?""",
+                        (index_status, now, job["document_id"]),
+                    )
+                if job["version_id"]:
+                    conn.execute(
+                        "UPDATE document_versions SET index_status = ? WHERE id = ?",
+                        (index_status, job["version_id"]),
+                    )
+            return len(expired)
 
     def claim_next_job(
         self, worker_id: str, lease_seconds: int = DEFAULT_LEASE_SECONDS
@@ -1577,17 +1657,27 @@ class KnowledgeStore:
             ).fetchone())
 
     def complete_job(
-        self, job_id: str, chunks_indexed: int = 0
+        self, job_id: str, worker_id: str, chunks_indexed: int = 0
     ) -> dict[str, Any]:
-        """Mark a job as successfully completed."""
+        """Complete a job only while ``worker_id`` still owns its lease."""
         now = utc_now()
         with self._transaction() as conn:
-            conn.execute(
+            result = conn.execute(
                 """UPDATE ingest_jobs SET state = 'completed', progress = 100,
                    chunks_indexed = ?, worker_id = '', lease_until = '',
-                   updated_at = ? WHERE id = ?""",
-                (chunks_indexed, now, job_id),
+                   updated_at = ? WHERE id = ? AND state = 'running'
+                   AND worker_id = ? AND lease_until >= ?""",
+                (chunks_indexed, now, job_id, worker_id, now),
             )
+            if result.rowcount != 1:
+                existing = conn.execute(
+                    "SELECT id FROM ingest_jobs WHERE id = ?", (job_id,)
+                ).fetchone()
+                if existing is None:
+                    raise StoreNotFound(f"job '{job_id}' not found")
+                raise StoreConflict(
+                    f"job '{job_id}' lease is no longer owned by '{worker_id}'"
+                )
             job = conn.execute(
                 "SELECT * FROM ingest_jobs WHERE id = ?", (job_id,)
             ).fetchone()
@@ -1600,8 +1690,8 @@ class KnowledgeStore:
                 )
             return dict(job) if job else {}
 
-    def fail_job(self, job_id: str, error_message: str) -> dict[str, Any]:
-        """Mark a job as failed; re-queue if retries remain."""
+    def fail_job(self, job_id: str, worker_id: str, error_message: str) -> dict[str, Any]:
+        """Fail/requeue a job only while ``worker_id`` owns its lease."""
         now = utc_now()
         with self._transaction() as conn:
             job = conn.execute(
@@ -1609,17 +1699,34 @@ class KnowledgeStore:
             ).fetchone()
             if job is None:
                 raise StoreNotFound(f"job '{job_id}' not found")
+            if (
+                job["state"] != "running"
+                or job["worker_id"] != worker_id
+                or not job["lease_until"]
+                or job["lease_until"] < now
+            ):
+                raise StoreConflict(
+                    f"job '{job_id}' lease is no longer owned by '{worker_id}'"
+                )
             new_retry = job["retry_count"] + 1
             if new_retry >= job["max_retries"]:
                 new_state = "failed"
             else:
                 new_state = "queued"
-            conn.execute(
+            result = conn.execute(
                 """UPDATE ingest_jobs SET state = ?, error = ?,
                    retry_count = ?, worker_id = '', lease_until = '',
-                   updated_at = ? WHERE id = ?""",
-                (new_state, error_message[:2000], new_retry, now, job_id),
+                   updated_at = ? WHERE id = ? AND state = 'running'
+                   AND worker_id = ? AND lease_until >= ?""",
+                (
+                    new_state, error_message[:2000], new_retry, now,
+                    job_id, worker_id, now,
+                ),
             )
+            if result.rowcount != 1:
+                raise StoreConflict(
+                    f"job '{job_id}' lease changed while recording failure"
+                )
             if job["document_id"]:
                 idx_status = "failed" if new_state == "failed" else "pending"
                 conn.execute(
@@ -1627,6 +1734,11 @@ class KnowledgeStore:
                        revision = revision + 1, updated_at = ?
                        WHERE id = ?""",
                     (idx_status, now, job["document_id"]),
+                )
+            if job["version_id"]:
+                conn.execute(
+                    "UPDATE document_versions SET index_status = ? WHERE id = ?",
+                    ("failed" if new_state == "failed" else "pending", job["version_id"]),
                 )
             return dict(conn.execute(
                 "SELECT * FROM ingest_jobs WHERE id = ?", (job_id,)
@@ -1647,6 +1759,73 @@ class KnowledgeStore:
                 (lease_until, utc_now(), job_id, worker_id),
             )
             return result.rowcount > 0
+
+    def finalize_ingest_job(
+        self,
+        job_id: str,
+        worker_id: str,
+        chunks_indexed: int,
+        weaviate_collection: str,
+    ) -> dict[str, Any]:
+        """Atomically activate the indexed version and complete its owned job.
+
+        Weaviate writes happen before this control-plane commit.  If a worker
+        loses its lease, the newly written chunks remain inactive because the
+        document's ``current_version_id`` is not switched by the stale worker.
+        """
+        now = utc_now()
+        with self._transaction() as conn:
+            job = conn.execute(
+                "SELECT * FROM ingest_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if job is None:
+                raise StoreNotFound(f"job '{job_id}' not found")
+            if (
+                job["state"] != "running"
+                or job["worker_id"] != worker_id
+                or not job["lease_until"]
+                or job["lease_until"] < now
+            ):
+                raise StoreConflict(
+                    f"job '{job_id}' lease is no longer owned by '{worker_id}'"
+                )
+
+            version_id = job["version_id"] or ""
+            if version_id:
+                version = conn.execute(
+                    "SELECT * FROM document_versions WHERE id = ?",
+                    (version_id,),
+                ).fetchone()
+                if version is None:
+                    raise StoreNotFound(f"version '{version_id}' not found")
+                if version["document_id"] != job["document_id"]:
+                    raise StoreConflict("job version does not belong to its document")
+                conn.execute(
+                    """UPDATE document_versions
+                       SET index_status = 'ready', chunk_count = ?,
+                           weaviate_collection = ?
+                       WHERE id = ?""",
+                    (chunks_indexed, weaviate_collection, version_id),
+                )
+                conn.execute(
+                    """UPDATE documents SET current_version_id = ?,
+                       index_status = 'ready', revision = revision + 1,
+                       updated_at = ? WHERE id = ?""",
+                    (version_id, now, job["document_id"]),
+                )
+
+            result = conn.execute(
+                """UPDATE ingest_jobs SET state = 'completed', progress = 100,
+                   chunks_indexed = ?, worker_id = '', lease_until = '',
+                   updated_at = ? WHERE id = ? AND state = 'running'
+                   AND worker_id = ? AND lease_until >= ?""",
+                (chunks_indexed, now, job_id, worker_id, now),
+            )
+            if result.rowcount != 1:
+                raise StoreConflict(f"job '{job_id}' lease changed during finalization")
+            return dict(conn.execute(
+                "SELECT * FROM ingest_jobs WHERE id = ?", (job_id,)
+            ).fetchone())
 
     # ------------------------------------------------------------------
     # Document Version management
@@ -1693,30 +1872,36 @@ class KnowledgeStore:
         self, version_id: str, chunk_count: int, weaviate_collection: str
     ) -> dict[str, Any]:
         """Mark a version as successfully indexed."""
-        now = utc_now()
         with self._transaction() as conn:
-            conn.execute(
+            result = conn.execute(
                 """UPDATE document_versions
                    SET index_status = 'ready', chunk_count = ?,
                        weaviate_collection = ?
-                   WHERE id = ?""",
+                   WHERE id = ? AND index_status IN ('pending', 'failed', 'ready')""",
                 (chunk_count, weaviate_collection, version_id),
             )
-            return dict(conn.execute(
+            row = conn.execute(
                 "SELECT * FROM document_versions WHERE id = ?", (version_id,)
-            ).fetchone())
+            ).fetchone()
+            if row is None:
+                raise StoreNotFound(f"version '{version_id}' not found")
+            if result.rowcount != 1:
+                raise StoreConflict(f"version '{version_id}' cannot be completed")
+            return dict(row)
 
     def fail_version(self, version_id: str, error_message: str = "") -> dict[str, Any]:
         """Mark a version as failed."""
-        now = utc_now()
         with self._transaction() as conn:
-            conn.execute(
+            result = conn.execute(
                 "UPDATE document_versions SET index_status = 'failed' WHERE id = ?",
                 (version_id,),
             )
-            return dict(conn.execute(
+            row = conn.execute(
                 "SELECT * FROM document_versions WHERE id = ?", (version_id,)
-            ).fetchone())
+            ).fetchone()
+            if row is None or result.rowcount != 1:
+                raise StoreNotFound(f"version '{version_id}' not found")
+            return dict(row)
 
     def activate_version(self, version_id: str) -> dict[str, Any]:
         """Atomically set a version as the current active version for its document.
@@ -1855,13 +2040,7 @@ class KnowledgeStore:
         reason_code: str = "",
         llm_reasoning: str = "",
     ) -> dict[str, Any]:
-        """Add a classification item to a proposal with schema validation.
-
-        Validates:
-        - source_node_id and target_node_id exist in the same library
-        - target_node_id is not the unclassified node
-        - document exists and belongs to the same library
-        """
+        """Add one version-locked item after validating the live taxonomy."""
         now = utc_now()
         item_id = f"pi-{uuid.uuid4().hex}"
         with self._transaction() as conn:
@@ -1870,14 +2049,14 @@ class KnowledgeStore:
             ).fetchone()
             if proposal is None:
                 raise StoreNotFound(f"proposal '{proposal_id}' not found")
-            if proposal["status"] != "draft":
+            if proposal["status"] not in {"draft", "reviewing"}:
                 raise StoreValidationError(
-                    f"proposal '{proposal_id}' is not in draft status (current: {proposal['status']})"
+                    f"proposal '{proposal_id}' no longer accepts items "
+                    f"(current: {proposal['status']})"
                 )
 
             library_id = proposal["library_id"]
 
-            # Validate source node
             source_node = conn.execute(
                 "SELECT * FROM taxonomy_nodes WHERE id = ? AND library_id = ?",
                 (source_node_id, library_id),
@@ -1887,7 +2066,6 @@ class KnowledgeStore:
                     f"source node '{source_node_id}' not found in library '{library_id}'"
                 )
 
-            # Validate target node
             target_node = conn.execute(
                 "SELECT * FROM taxonomy_nodes WHERE id = ? AND library_id = ?",
                 (target_node_id, library_id),
@@ -1896,9 +2074,14 @@ class KnowledgeStore:
                 raise StoreValidationError(
                     f"target node '{target_node_id}' not found in library '{library_id}'"
                 )
-            if target_node["is_unclassified"]:
+            if (
+                target_node["is_unclassified"]
+                or target_node["status"] != "active"
+                or target_node["kind"] != "physical"
+                or target_node["locked"]
+            ):
                 raise StoreValidationError(
-                    f"target node '{target_node_id}' is the unclassified node"
+                    f"target node '{target_node_id}' is not an active, writable physical node"
                 )
 
             # Validate document
@@ -1911,27 +2094,57 @@ class KnowledgeStore:
                     f"document '{document_id}' not found in library '{library_id}'"
                 )
 
-            # Get current version_id for lock
             version_id = doc["current_version_id"] or ""
-
-            # Get current primary placement
+            if not version_id:
+                newest_version = conn.execute(
+                    """SELECT id FROM document_versions WHERE document_id = ?
+                       ORDER BY version_number DESC LIMIT 1""",
+                    (document_id,),
+                ).fetchone()
+                if newest_version is None:
+                    raise StoreConflict(
+                        f"document '{document_id}' has no version to lock"
+                    )
+                version_id = newest_version["id"]
             placement = conn.execute(
                 """SELECT node_id FROM document_placements
                    WHERE document_id = ? AND placement_type = 'PRIMARY'""",
                 (document_id,),
             ).fetchone()
-            previous_node_id = placement["node_id"] if placement else source_node_id
+            if placement is None:
+                raise StoreConflict(f"document '{document_id}' has no primary placement")
+            previous_node_id = placement["node_id"]
+            if previous_node_id != source_node_id:
+                raise StoreConflict(
+                    f"document '{document_id}' moved from '{source_node_id}' "
+                    f"to '{previous_node_id}' before proposal creation"
+                )
+            duplicate = conn.execute(
+                """SELECT id FROM proposal_items
+                   WHERE proposal_id = ? AND document_id = ?""",
+                (proposal_id, document_id),
+            ).fetchone()
+            if duplicate:
+                raise StoreConflict(
+                    f"document '{document_id}' already exists in proposal '{proposal_id}'"
+                )
+
+            confidence = float(confidence)
+            if confidence < 0.0 or confidence > 1.0:
+                raise StoreValidationError("proposal confidence must be between 0 and 1")
 
             conn.execute(
                 """INSERT INTO proposal_items
                    (id, proposal_id, document_id, version_id, source_node_id,
                     target_node_id, status, confidence, reason_code, llm_reasoning,
-                    previous_node_id, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)""",
+                    previous_node_id, previous_document_status,
+                    base_document_revision, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     item_id, proposal_id, document_id, version_id,
                     source_node_id, target_node_id, confidence,
-                    reason_code, llm_reasoning, previous_node_id, now, now,
+                    reason_code, llm_reasoning, previous_node_id,
+                    doc["status"], doc["revision"], now, now,
                 ),
             )
             return dict(conn.execute(
@@ -1944,15 +2157,23 @@ class KnowledgeStore:
         """List classification proposals."""
         conn = self._connect()
         try:
-            query = "SELECT * FROM classification_proposals WHERE 1=1"
+            query = """SELECT p.*,
+                       COUNT(i.id) AS item_count,
+                       COALESCE(SUM(CASE WHEN i.status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_count,
+                       COALESCE(SUM(CASE WHEN i.status = 'approved' THEN 1 ELSE 0 END), 0) AS approved_count,
+                       COALESCE(SUM(CASE WHEN i.status = 'rejected' THEN 1 ELSE 0 END), 0) AS rejected_count,
+                       COALESCE(SUM(CASE WHEN i.status = 'applied' THEN 1 ELSE 0 END), 0) AS applied_count
+                       FROM classification_proposals p
+                       LEFT JOIN proposal_items i ON i.proposal_id = p.id
+                       WHERE 1=1"""
             params = []
             if library_id:
-                query += " AND library_id = ?"
+                query += " AND p.library_id = ?"
                 params.append(library_id)
             if status:
-                query += " AND status = ?"
+                query += " AND p.status = ?"
                 params.append(status)
-            query += " ORDER BY created_at DESC LIMIT ?"
+            query += " GROUP BY p.id ORDER BY p.created_at DESC LIMIT ?"
             params.append(min(max(int(limit), 1), 200))
             rows = conn.execute(query, params).fetchall()
             return [dict(r) for r in rows]
@@ -1969,46 +2190,144 @@ class KnowledgeStore:
             if proposal is None:
                 raise StoreNotFound(f"proposal '{proposal_id}' not found")
             items = conn.execute(
-                """SELECT * FROM proposal_items WHERE proposal_id = ?
-                   ORDER BY created_at""",
+                """SELECT i.*, d.title AS document_title,
+                          d.source_name AS document_source_name,
+                          d.current_version_id AS live_version_id,
+                          d.revision AS live_document_revision,
+                          source.name AS source_node_name,
+                          target.name AS target_node_name
+                   FROM proposal_items i
+                   JOIN documents d ON d.id = i.document_id
+                   LEFT JOIN taxonomy_nodes source ON source.id = i.source_node_id
+                   LEFT JOIN taxonomy_nodes target ON target.id = i.target_node_id
+                   WHERE i.proposal_id = ? ORDER BY i.created_at""",
                 (proposal_id,),
             ).fetchall()
             result = dict(proposal)
+            for field, fallback in (
+                ("llm_response_json", {}),
+                ("routing_cards_json", []),
+                ("subtree_json", []),
+            ):
+                try:
+                    result[field.removesuffix("_json")] = json.loads(result[field])
+                except (TypeError, ValueError):
+                    result[field.removesuffix("_json")] = fallback
             result["items"] = [dict(i) for i in items]
+            result["item_count"] = len(items)
+            for status in ("pending", "approved", "rejected", "applied", "reverted"):
+                result[f"{status}_count"] = sum(
+                    1 for item in items if item["status"] == status
+                )
             return result
         finally:
             conn.close()
 
-    def approve_proposal_item(self, item_id: str) -> dict[str, Any]:
-        """Mark a proposal item as approved (ready to apply)."""
+    @staticmethod
+    def _require_proposal_item(
+        conn: sqlite3.Connection, proposal_id: str, item_id: str
+    ) -> sqlite3.Row:
+        item = conn.execute(
+            "SELECT * FROM proposal_items WHERE id = ? AND proposal_id = ?",
+            (item_id, proposal_id),
+        ).fetchone()
+        if item is None:
+            raise StoreNotFound(
+                f"proposal item '{item_id}' not found in proposal '{proposal_id}'"
+            )
+        return item
+
+    @staticmethod
+    def _validate_proposal_item_context(
+        conn: sqlite3.Connection, item: sqlite3.Row, require_base_revision: bool = True
+    ) -> tuple[sqlite3.Row, sqlite3.Row, sqlite3.Row]:
+        document = conn.execute(
+            "SELECT * FROM documents WHERE id = ?", (item["document_id"],)
+        ).fetchone()
+        if document is None:
+            raise StoreNotFound(f"document '{item['document_id']}' not found")
+        target = conn.execute(
+            "SELECT * FROM taxonomy_nodes WHERE id = ?", (item["target_node_id"],)
+        ).fetchone()
+        if target is None:
+            raise StoreNotFound(f"target node '{item['target_node_id']}' not found")
+        if (
+            target["library_id"] != document["library_id"]
+            or target["status"] != "active"
+            or target["kind"] != "physical"
+            or target["is_unclassified"]
+            or target["locked"]
+        ):
+            raise StoreConflict(
+                f"target node '{item['target_node_id']}' is no longer writable"
+            )
+        placement = conn.execute(
+            """SELECT * FROM document_placements
+               WHERE document_id = ? AND placement_type = 'PRIMARY'""",
+            (item["document_id"],),
+        ).fetchone()
+        if placement is None or placement["node_id"] != item["previous_node_id"]:
+            live_node = placement["node_id"] if placement else "<missing>"
+            raise StoreConflict(
+                f"document '{item['document_id']}' placement changed to '{live_node}'"
+            )
+        if (document["current_version_id"] or "") != item["version_id"]:
+            raise StoreConflict(
+                f"document '{item['document_id']}' version changed after proposal creation"
+            )
+        if require_base_revision and document["revision"] != item["base_document_revision"]:
+            raise StoreConflict(
+                f"document '{item['document_id']}' revision changed after proposal creation"
+            )
+        return document, placement, target
+
+    @staticmethod
+    def _refresh_proposal_review_status(
+        conn: sqlite3.Connection, proposal_id: str, now: str
+    ) -> None:
+        pending = conn.execute(
+            """SELECT COUNT(*) FROM proposal_items
+               WHERE proposal_id = ? AND status = 'pending'""",
+            (proposal_id,),
+        ).fetchone()[0]
+        status = "reviewing" if pending else "reviewed"
+        conn.execute(
+            """UPDATE classification_proposals SET status = ?, updated_at = ?
+               WHERE id = ? AND status IN ('draft', 'reviewing', 'reviewed')""",
+            (status, now, proposal_id),
+        )
+
+    def approve_proposal_item(self, proposal_id: str, item_id: str) -> dict[str, Any]:
+        """Approve an item only if its version, revision and placement still match."""
         now = utc_now()
         with self._transaction() as conn:
-            item = conn.execute(
-                "SELECT * FROM proposal_items WHERE id = ?", (item_id,)
-            ).fetchone()
-            if item is None:
-                raise StoreNotFound(f"proposal item '{item_id}' not found")
+            item = self._require_proposal_item(conn, proposal_id, item_id)
+            if item["status"] == "approved":
+                return dict(item)
             if item["status"] != "pending":
                 raise StoreValidationError(
                     f"item '{item_id}' is not pending (current: {item['status']})"
                 )
+            self._validate_proposal_item_context(conn, item)
             conn.execute(
-                "UPDATE proposal_items SET status = 'approved', updated_at = ? WHERE id = ?",
-                (now, item_id),
+                """UPDATE proposal_items SET status = 'approved', reviewed_at = ?,
+                   conflict_reason = '', updated_at = ? WHERE id = ?""",
+                (now, now, item_id),
             )
+            self._refresh_proposal_review_status(conn, proposal_id, now)
             return dict(conn.execute(
                 "SELECT * FROM proposal_items WHERE id = ?", (item_id,)
             ).fetchone())
 
-    def reject_proposal_item(self, item_id: str, reason: str = "") -> dict[str, Any]:
+    def reject_proposal_item(
+        self, proposal_id: str, item_id: str, reason: str = ""
+    ) -> dict[str, Any]:
         """Mark a proposal item as rejected."""
         now = utc_now()
         with self._transaction() as conn:
-            item = conn.execute(
-                "SELECT * FROM proposal_items WHERE id = ?", (item_id,)
-            ).fetchone()
-            if item is None:
-                raise StoreNotFound(f"proposal item '{item_id}' not found")
+            item = self._require_proposal_item(conn, proposal_id, item_id)
+            if item["status"] == "rejected":
+                return dict(item)
             if item["status"] != "pending":
                 raise StoreValidationError(
                     f"item '{item_id}' is not pending (current: {item['status']})"
@@ -2016,20 +2335,16 @@ class KnowledgeStore:
             conn.execute(
                 """UPDATE proposal_items SET status = 'rejected',
                    llm_reasoning = CASE WHEN ? != '' THEN ? ELSE llm_reasoning END,
-                   updated_at = ? WHERE id = ?""",
-                (reason, reason, now, item_id),
+                   reviewed_at = ?, updated_at = ? WHERE id = ?""",
+                (reason, reason, now, now, item_id),
             )
+            self._refresh_proposal_review_status(conn, proposal_id, now)
             return dict(conn.execute(
                 "SELECT * FROM proposal_items WHERE id = ?", (item_id,)
             ).fetchone())
 
     def apply_proposal(self, proposal_id: str) -> dict[str, Any]:
-        """Apply all approved items in a proposal.
-
-        For each approved item:
-        - Update document's primary placement to target_node_id
-        - Record the change for potential revert
-        """
+        """Atomically apply every approved item after a full conflict preflight."""
         now = utc_now()
         with self._transaction() as conn:
             proposal = conn.execute(
@@ -2037,65 +2352,115 @@ class KnowledgeStore:
             ).fetchone()
             if proposal is None:
                 raise StoreNotFound(f"proposal '{proposal_id}' not found")
+            if proposal["status"] == "applied":
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM proposal_items WHERE proposal_id = ? AND status = 'applied'",
+                    (proposal_id,),
+                ).fetchone()[0]
+                return {
+                    "proposal_id": proposal_id,
+                    "status": "applied",
+                    "applied_count": count,
+                    "idempotent": True,
+                }
+            if proposal["status"] == "reverted":
+                raise StoreConflict("a reverted proposal cannot be applied again")
+            if proposal["status"] not in {"draft", "reviewing", "reviewed"}:
+                raise StoreConflict(
+                    f"proposal '{proposal_id}' cannot be applied from '{proposal['status']}'"
+                )
 
             items = conn.execute(
                 """SELECT * FROM proposal_items WHERE proposal_id = ? AND status = 'approved'""",
                 (proposal_id,),
             ).fetchall()
+            if not items:
+                raise StoreValidationError("proposal has no approved items to apply")
+
+            # Preflight the entire batch before the first write.  BEGIN IMMEDIATE
+            # prevents another SQLite writer from changing a checked document
+            # between validation and placement update.
+            contexts: list[tuple[sqlite3.Row, sqlite3.Row, sqlite3.Row, sqlite3.Row]] = []
+            for item in items:
+                document, placement, target = self._validate_proposal_item_context(
+                    conn, item
+                )
+                alias_collision = conn.execute(
+                    """SELECT 1 FROM document_placements
+                       WHERE document_id = ? AND node_id = ?
+                         AND placement_type = 'ALIAS'""",
+                    (item["document_id"], item["target_node_id"]),
+                ).fetchone()
+                if alias_collision:
+                    raise StoreConflict(
+                        f"document '{item['document_id']}' already aliases target "
+                        f"'{item['target_node_id']}'"
+                    )
+                contexts.append((item, document, placement, target))
 
             applied_count = 0
-            for item in items:
-                # Update primary placement
+            for item, document, _placement, _target in contexts:
                 conn.execute(
-                    """UPDATE document_placements SET node_id = ?
-                       WHERE document_id = ? AND placement_type = 'PRIMARY'""",
-                    (item["target_node_id"], item["document_id"]),
-                )
-                # If no placement exists, create one
-                existing = conn.execute(
-                    """SELECT 1 FROM document_placements
+                    """DELETE FROM document_placements
                        WHERE document_id = ? AND placement_type = 'PRIMARY'""",
                     (item["document_id"],),
-                ).fetchone()
-                if not existing:
-                    conn.execute(
-                        """INSERT INTO document_placements
-                           (document_id, node_id, placement_type, created_at)
-                           VALUES (?, ?, 'PRIMARY', ?)""",
-                        (item["document_id"], item["target_node_id"], now),
-                    )
-
-                # Update document status
-                conn.execute(
-                    """UPDATE documents SET status = 'classified',
-                       revision = revision + 1, updated_at = ?
-                       WHERE id = ?""",
-                    (now, item["document_id"]),
                 )
-
-                # Mark item as applied
+                conn.execute(
+                    """INSERT INTO document_placements
+                       (document_id, node_id, placement_type, created_at)
+                       VALUES (?, ?, 'PRIMARY', ?)""",
+                    (item["document_id"], item["target_node_id"], now),
+                )
+                applied_revision = document["revision"] + 1
+                updated = conn.execute(
+                    """UPDATE documents SET status = 'active', revision = ?,
+                       updated_at = ? WHERE id = ? AND revision = ?""",
+                    (
+                        applied_revision, now, item["document_id"],
+                        document["revision"],
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise StoreConflict(
+                        f"document '{item['document_id']}' changed during proposal apply"
+                    )
                 conn.execute(
                     """UPDATE proposal_items SET status = 'applied', applied_at = ?,
+                       applied_document_revision = ?, conflict_reason = '',
                        updated_at = ? WHERE id = ?""",
-                    (now, now, item["id"]),
+                    (now, applied_revision, now, item["id"]),
+                )
+                conn.execute(
+                    """INSERT INTO audit_events
+                       (id, actor, action, target_type, target_id, library_id,
+                        before_json, after_json, trace_id, created_at)
+                       VALUES (?, 'auto-classifier', 'APPLY_PROPOSAL_ITEM',
+                               'document', ?, ?, ?, ?, ?, ?)""",
+                    (
+                        new_id("audit"), item["document_id"], proposal["library_id"],
+                        json.dumps({"node_id": item["previous_node_id"]}),
+                        json.dumps({"node_id": item["target_node_id"]}),
+                        proposal_id, now,
+                    ),
                 )
                 applied_count += 1
 
-            # Update proposal status
             conn.execute(
-                """UPDATE classification_proposals SET status = 'applied', updated_at = ?
+                """UPDATE classification_proposals SET status = 'applied',
+                   applied_at = ?, reverted_at = '', updated_at = ?
                    WHERE id = ?""",
-                (now, proposal_id),
+                (now, now, proposal_id),
             )
 
             return {
                 "proposal_id": proposal_id,
                 "status": "applied",
                 "applied_count": applied_count,
+                "idempotent": False,
             }
 
     def revert_proposal(self, proposal_id: str) -> dict[str, Any]:
-        """Revert all applied items in a proposal to their previous nodes."""
+        """Revert only when no later version, edit or manual move would be lost."""
         now = utc_now()
         with self._transaction() as conn:
             proposal = conn.execute(
@@ -2103,49 +2468,131 @@ class KnowledgeStore:
             ).fetchone()
             if proposal is None:
                 raise StoreNotFound(f"proposal '{proposal_id}' not found")
+            if proposal["status"] == "reverted":
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM proposal_items WHERE proposal_id = ? AND status = 'reverted'",
+                    (proposal_id,),
+                ).fetchone()[0]
+                return {
+                    "proposal_id": proposal_id,
+                    "status": "reverted",
+                    "reverted_count": count,
+                    "idempotent": True,
+                }
+            if proposal["status"] != "applied":
+                raise StoreConflict(
+                    f"proposal '{proposal_id}' is not applied (current: {proposal['status']})"
+                )
 
             items = conn.execute(
                 """SELECT * FROM proposal_items WHERE proposal_id = ? AND status = 'applied'""",
                 (proposal_id,),
             ).fetchall()
+            if not items:
+                raise StoreConflict("applied proposal has no applied items")
+
+            contexts: list[tuple[sqlite3.Row, sqlite3.Row]] = []
+            for item in items:
+                document = self._require_document(conn, item["document_id"])
+                placement = conn.execute(
+                    """SELECT * FROM document_placements
+                       WHERE document_id = ? AND placement_type = 'PRIMARY'""",
+                    (item["document_id"],),
+                ).fetchone()
+                if placement is None or placement["node_id"] != item["target_node_id"]:
+                    raise StoreConflict(
+                        f"document '{item['document_id']}' moved after proposal apply"
+                    )
+                if (document["current_version_id"] or "") != item["version_id"]:
+                    raise StoreConflict(
+                        f"document '{item['document_id']}' version changed after proposal apply"
+                    )
+                if document["revision"] != item["applied_document_revision"]:
+                    raise StoreConflict(
+                        f"document '{item['document_id']}' was edited after proposal apply"
+                    )
+                previous = conn.execute(
+                    "SELECT * FROM taxonomy_nodes WHERE id = ?",
+                    (item["previous_node_id"],),
+                ).fetchone()
+                if (
+                    previous is None
+                    or previous["status"] != "active"
+                    or previous["kind"] != "physical"
+                    or previous["library_id"] != proposal["library_id"]
+                ):
+                    raise StoreConflict(
+                        f"previous node '{item['previous_node_id']}' is no longer available"
+                    )
+                alias_collision = conn.execute(
+                    """SELECT 1 FROM document_placements WHERE document_id = ?
+                       AND node_id = ? AND placement_type = 'ALIAS'""",
+                    (item["document_id"], item["previous_node_id"]),
+                ).fetchone()
+                if alias_collision:
+                    raise StoreConflict(
+                        f"document '{item['document_id']}' now aliases its previous node"
+                    )
+                contexts.append((item, document))
 
             reverted_count = 0
-            for item in items:
-                if not item["previous_node_id"]:
-                    continue
-
-                # Restore primary placement
+            for item, document in contexts:
                 conn.execute(
-                    """UPDATE document_placements SET node_id = ?
+                    """DELETE FROM document_placements
                        WHERE document_id = ? AND placement_type = 'PRIMARY'""",
-                    (item["previous_node_id"], item["document_id"]),
+                    (item["document_id"],),
                 )
-
-                # Update document status
                 conn.execute(
-                    """UPDATE documents SET status = 'unclassified',
-                       revision = revision + 1, updated_at = ?
-                       WHERE id = ?""",
-                    (now, item["document_id"]),
+                    """INSERT INTO document_placements
+                       (document_id, node_id, placement_type, created_at)
+                       VALUES (?, ?, 'PRIMARY', ?)""",
+                    (item["document_id"], item["previous_node_id"], now),
                 )
-
-                # Mark item as reverted
+                restored_status = item["previous_document_status"]
+                if restored_status not in {"unclassified", "active", "archived", "trash"}:
+                    restored_status = "unclassified"
+                updated = conn.execute(
+                    """UPDATE documents SET status = ?, revision = revision + 1,
+                       updated_at = ? WHERE id = ? AND revision = ?""",
+                    (
+                        restored_status, now, item["document_id"],
+                        document["revision"],
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise StoreConflict(
+                        f"document '{item['document_id']}' changed during proposal revert"
+                    )
                 conn.execute(
                     """UPDATE proposal_items SET status = 'reverted', reverted_at = ?,
                        updated_at = ? WHERE id = ?""",
                     (now, now, item["id"]),
                 )
+                conn.execute(
+                    """INSERT INTO audit_events
+                       (id, actor, action, target_type, target_id, library_id,
+                        before_json, after_json, trace_id, created_at)
+                       VALUES (?, 'auto-classifier', 'REVERT_PROPOSAL_ITEM',
+                               'document', ?, ?, ?, ?, ?, ?)""",
+                    (
+                        new_id("audit"), item["document_id"], proposal["library_id"],
+                        json.dumps({"node_id": item["target_node_id"]}),
+                        json.dumps({"node_id": item["previous_node_id"]}),
+                        proposal_id, now,
+                    ),
+                )
                 reverted_count += 1
 
-            # Update proposal status
             conn.execute(
-                """UPDATE classification_proposals SET status = 'reverted', updated_at = ?
+                """UPDATE classification_proposals SET status = 'reverted',
+                   reverted_at = ?, updated_at = ?
                    WHERE id = ?""",
-                (now, proposal_id),
+                (now, now, proposal_id),
             )
 
             return {
                 "proposal_id": proposal_id,
                 "status": "reverted",
                 "reverted_count": reverted_count,
+                "idempotent": False,
             }

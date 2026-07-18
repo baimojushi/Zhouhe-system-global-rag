@@ -25,4 +25,6 @@ Windows 不要直接运行 `.next\standalone\server.js`；请使用 `npm start` 
 
 知识库页面已升级为多级目录工作台，内置 AI 工作记录、学术资料、生产文档、个人思维笔记和关联知识库。闭源 AI 归类采用“手动大类 → 未归类 → 点击生成提案 → 人工确认”的流程，后端与 Token 预算见 [BACKEND_KNOWLEDGE_ITERATION_PLAN.md](BACKEND_KNOWLEDGE_ITERATION_PLAN.md)。
 
+Schema V5 已补齐持久化提案历史、逐项批准/拒绝、版本锁冲突、原子应用与安全撤销，并加固 Worker 租约和版本激活。升级、API、回滚和验证步骤见 [SCHEMA_V5_HARDENING_REPORT_20260718.md](SCHEMA_V5_HARDENING_REPORT_20260718.md)。
+
 下一版本地问答与问题分类器以 Gemma 4 31B GGUF / llama.cpp 为生成模型，BGE-M3 继续内置于 Gateway 负责向量化，不再依赖 Ollama 或 vLLM。完整落地方案见 [docs/Gemma4-31B-Vector-RAG-Implementation-Plan-CN.md](docs/Gemma4-31B-Vector-RAG-Implementation-Plan-CN.md)，本机端口与迁移目标见 [NEXT_VERSION_GEMMA_TARGET.md](NEXT_VERSION_GEMMA_TARGET.md)。
