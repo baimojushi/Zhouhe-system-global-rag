@@ -242,6 +242,68 @@ function formatTime(value: string): string {
   return new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }).format(parsed);
 }
 
+function documentStatusLabel(status: string): string {
+  return ({
+    unclassified: "待整理",
+    active: "正常使用",
+    archived: "已归档",
+    trash: "回收站",
+  } as Record<string, string>)[status] ?? "状态未知";
+}
+
+function indexStatusLabel(status: string): string {
+  return ({
+    queued: "等待处理",
+    running: "正在处理",
+    processing: "正在处理",
+    ready: "可以搜索",
+    indexed: "可以搜索",
+    stale: "等待更新",
+    failed: "处理失败",
+  } as Record<string, string>)[status] ?? "尚未处理";
+}
+
+function proposalStatusLabel(status: string): string {
+  return ({
+    draft: "准备中",
+    reviewing: "等待确认",
+    reviewed: "已确认",
+    applied: "已执行",
+    reverted: "已撤销",
+    pending: "待确认",
+    approved: "同意采用",
+    rejected: "不采用",
+  } as Record<string, string>)[status] ?? "状态未知";
+}
+
+function jobStatusLabel(status: string): string {
+  return ({
+    queued: "等待导入",
+    running: "正在导入",
+    completed: "导入完成",
+    succeeded: "导入完成",
+    failed: "导入失败",
+    cancelled: "已取消",
+  } as Record<string, string>)[status] ?? "状态未知";
+}
+
+function nodeKindLabel(kind: string): string {
+  return ({ physical: "普通分类", smart: "自动筛选分类", alias: "分类快捷方式" } as Record<string, string>)[kind] ?? "普通分类";
+}
+
+function auditActionLabel(action: string): string {
+  return ({
+    create: "新建",
+    update: "修改",
+    delete: "删除",
+    archive: "归档",
+    move: "移动",
+    ingest: "导入资料",
+    apply_proposal: "采用整理建议",
+    revert_proposal: "撤销整理建议",
+  } as Record<string, string>)[action] ?? action.replaceAll("_", " ");
+}
+
 function TreeBranch({
   nodes,
   depth,
@@ -372,7 +434,7 @@ export function KnowledgeWorkbench({
         setActiveId(data.libraries[0].id);
       }
     } catch (error) {
-      setConnectionError(error instanceof Error ? error.message : "V2 控制面连接失败");
+      setConnectionError(error instanceof Error ? error.message : "资料管理服务连接失败");
     }
   }, [activeId, callGateway, demoMode]);
 
@@ -459,7 +521,7 @@ export function KnowledgeWorkbench({
       );
       setProposals(data.proposals);
     } catch (error) {
-      setConnectionError(error instanceof Error ? error.message : "AI 提案列表加载失败");
+      setConnectionError(error instanceof Error ? error.message : "分类建议列表加载失败");
     }
   }, [callGateway, demoMode]);
 
@@ -473,7 +535,7 @@ export function KnowledgeWorkbench({
       setProposal(detail);
       setProposalPanelOpen(true);
     } catch (error) {
-      onNotice(error instanceof Error ? error.message : "AI 提案详情加载失败");
+      onNotice(error instanceof Error ? error.message : "分类建议详情加载失败");
     } finally {
       setProposalLoading(false);
     }
@@ -598,7 +660,7 @@ export function KnowledgeWorkbench({
 
   async function moveNode(sourceId: string, targetParentId: string) {
     if (demoMode) {
-      onNotice("拖拽目标已识别；真实模式会提交可审计的目录移动变更");
+      onNotice("已识别新的分类位置；切换到本地模式后会保存这次移动");
       return;
     }
     try {
@@ -670,7 +732,15 @@ export function KnowledgeWorkbench({
       onNotice(error instanceof Error ? error.message : "文档保存失败");
     }
   }
-  async function saveDocumentDetails(){await updateFocusedDocument({title:documentDraft.title,owner:documentDraft.owner,metadata:JSON.parse(documentDraft.metadata)})}
+  async function saveDocumentDetails(){await updateFocusedDocument({title:documentDraft.title,owner:documentDraft.owner})}
+  async function saveDocumentMetadata(){
+    try {
+      await updateFocusedDocument({metadata:JSON.parse(documentDraft.metadata)});
+      onNotice("自定义信息已保存");
+    } catch (error) {
+      onNotice(error instanceof SyntaxError ? "自定义信息格式有误，请检查括号、引号和逗号" : error instanceof Error ? error.message : "保存自定义信息失败");
+    }
+  }
   async function saveLibrarySettings(e:FormEvent){e.preventDefault();await callGateway(`/v2/libraries/${activeId}`,{method:"PATCH",body:JSON.stringify(librarySettings)});setDialog(null);await loadLibraries()}
   async function removeAlias(id:string){if(focusedDocument)setFocusedDocument(await callGateway<DocumentRecord>(`/v2/documents/${focusedDocument.id}/aliases/${id}`,{method:"DELETE"}))}
   async function toggleTag(id:string){if(!focusedDocument)return;const ids=new Set(focusedDocument.tags.map(t=>t.id));if(ids.has(id))ids.delete(id);else ids.add(id);setFocusedDocument(await callGateway<DocumentRecord>(`/v2/documents/${focusedDocument.id}/tags`,{method:"PUT",body:JSON.stringify({tag_ids:[...ids]})}))}
@@ -725,7 +795,7 @@ export function KnowledgeWorkbench({
 
   async function enqueueIngest() {
     if (!selectedNode || selectedNode.kind === "smart") {
-      onNotice("请选择实体目录作为摄取目标");
+      onNotice("请选择一个普通分类作为导入位置");
       return;
     }
     if (demoMode) {
@@ -738,9 +808,9 @@ export function KnowledgeWorkbench({
         body: JSON.stringify({ path: ingestPath, library_id: activeId, target_node_id: selectedNode.id }),
       });
       await refreshCurrent();
-      onNotice(`摄取任务 ${result.job.id.slice(0, 16)} 已进入持久化队列`);
+      onNotice(`导入任务 ${result.job.id.slice(0, 16)} 已加入后台处理`);
     } catch (error) {
-      onNotice(error instanceof Error ? error.message : "加入摄取队列失败");
+      onNotice(error instanceof Error ? error.message : "开始导入失败");
     }
   }
 
@@ -775,9 +845,9 @@ export function KnowledgeWorkbench({
       }
       await Promise.all([loadProposal(result.proposal_id), loadProposals(activeId)]);
       const invalid = result.validation_errors?.length ?? 0;
-      onNotice(`AI 提案已保存：${result.items.length} 项待审核${invalid ? `，${invalid} 项未通过校验` : ""}`);
+      onNotice(`分类建议已保存：${result.items.length} 项待确认${invalid ? `，${invalid} 项无法采用` : ""}`);
     } catch (error) {
-      onNotice(error instanceof Error ? error.message : "AI 提案生成失败");
+      onNotice(error instanceof Error ? error.message : "生成分类建议失败");
     } finally {
       setProposalLoading(false);
     }
@@ -838,109 +908,127 @@ export function KnowledgeWorkbench({
   return <div className="page inner-page knowledge-page knowledge-v2">
     <div className="kb-title-row">
       <div className="page-title">
-        <div className="eyebrow"><span/>KNOWLEDGE CONTROL PLANE · V2</div>
-        <h1>知识资产工作台</h1>
-        <p>目录、文档、版本和任务已分离管理。手动操作优先，AI 只生成可审查提案。</p>
+        <div className="eyebrow"><span/>整理和维护你的资料</div>
+        <h1>知识库管理</h1>
+        <p>先选择知识库，再选择分类，最后管理其中的资料。智能助手只提出建议，是否采用由你决定。</p>
       </div>
       <div className="kb-header-actions">
-        <span className={`control-plane-badge ${connectionError ? "is-error" : ""}`}><i/>{demoMode ? "演示数据" : connectionError ? "控制面离线" : "SQLite 控制面在线"}</span>
-        <button className="outline-button" onClick={() => { setProposalPanelOpen(true); if (!proposal && proposals[0]) void loadProposal(proposals[0].id); }}>提案队列 · {proposals.length}</button>
-        <button className="outline-button" onClick={() => void requestClassification()} disabled={proposalLoading}>{proposalLoading ? "生成中…" : "＋ 生成 AI 提案"}</button>
-        <button className="outline-button" onClick={()=>{setLibrarySettings({name:activeLibrary.name,description:activeLibrary.description,policy:activeLibrary.policy,status:activeLibrary.status});setDialog({type:"library-settings"})}}>库设置</button>
-        <button className="primary-button compact" onClick={() => setDialog({ type: "library" })}>＋ 新建知识库</button>
+        <span className={`control-plane-badge ${connectionError ? "is-error" : ""}`}>
+          <i/>{demoMode ? "正在使用演示数据" : connectionError ? "资料管理服务暂时不可用" : "资料管理服务正常"}
+        </span>
+        <button className="outline-button" onClick={() => { setProposalPanelOpen(true); if (!proposal && proposals[0]) void loadProposal(proposals[0].id); }}>
+          查看分类建议 <b>{proposals.length}</b>
+        </button>
+        <button className="outline-button" onClick={() => void requestClassification()} disabled={proposalLoading || activeLibrary.kind === "association"} title={activeLibrary.kind === "association" ? "关联知识库不需要分类资料" : undefined}>
+          {proposalLoading ? "正在分析…" : "让助手整理待分类资料"}
+        </button>
+        <button className="outline-button" onClick={() => { setLibrarySettings({ name: activeLibrary.name, description: activeLibrary.description, policy: activeLibrary.policy, status: activeLibrary.status }); setDialog({ type: "library-settings" }); }}>
+          当前知识库设置
+        </button>
+        <button className="primary-button compact" onClick={() => setDialog({ type: "library" })}>新建知识库</button>
       </div>
     </div>
 
-    {connectionError && <div className="kb-error-banner"><b>V2 控制面不可用</b><span>{connectionError}</span><button onClick={() => void refreshCurrent()}>重试</button></div>}
+    {connectionError && <div className="kb-error-banner">
+      <div><b>暂时无法读取真实资料</b><span>{connectionError}</span></div>
+      <button onClick={() => void refreshCurrent()}>重新连接</button>
+    </div>}
 
     <section className="kb-overview-strip" aria-label="知识库概览">
-      <div><small>知识库</small><b>{libraries.length}</b><span>独立集合与策略</span></div>
-      <div><small>正式文档</small><b>{overview.documents}</b><span>稳定 Document ID</span></div>
-      <div><small>未归类</small><b>{overview.unclassified}</b><span>等待人工或提案</span></div>
-      <div><small>活动任务</small><b>{overview.queued}</b><span>重启后可恢复</span></div>
+      <div><small>知识库数量</small><b>{libraries.length}</b><span>不同用途分开管理</span></div>
+      <div><small>已收录资料</small><b>{overview.documents}</b><span>所有知识库合计</span></div>
+      <div><small>待整理资料</small><b>{overview.unclassified}</b><span>还没有放入合适分类</span></div>
+      <div><small>正在处理</small><b>{overview.queued}</b><span>导入完成后可搜索</span></div>
     </section>
-    <nav className="deep-management-tabs"><button onClick={()=>setManagementView("browse")}>目录与文档</button><button onClick={()=>setManagementView("jobs")}>摄取任务</button><button onClick={()=>setManagementView("audit")}>审计记录</button><button disabled={activeLibrary.kind!=="association"} onClick={()=>setManagementView("associations")}>潜在关联</button></nav>
 
-    {managementView==="browse"&&<section className="kb-workbench kb-workbench-v2">
-      <aside className="library-rail" aria-label="知识库">
-        <div className="rail-head"><span>LIBRARIES</span><button onClick={() => setDialog({ type: "library" })} title="新建知识库">＋</button></div>
+    <nav className="deep-management-tabs knowledge-sections" aria-label="知识库功能">
+      <button className={managementView === "browse" ? "active" : ""} onClick={() => setManagementView("browse")}><b>资料与分类</b><small>日常整理和查看</small></button>
+      <button className={managementView === "jobs" ? "active" : ""} onClick={() => setManagementView("jobs")}><b>导入进度</b><small>查看处理结果</small></button>
+      <button className={managementView === "audit" ? "active" : ""} onClick={() => setManagementView("audit")}><b>操作记录</b><small>追溯重要改动</small></button>
+      <button className={managementView === "associations" ? "active" : ""} disabled={activeLibrary.kind !== "association"} onClick={() => setManagementView("associations")}><b>跨库关联</b><small>发现资料间联系</small></button>
+    </nav>
+
+    {managementView === "browse" && <section className="kb-workbench kb-workbench-v2">
+      <aside className="library-rail" aria-label="选择知识库">
+        <div className="rail-head">
+          <div><span className="step-chip">第 1 步</span><b>选择知识库</b><small>不同知识库互相隔离</small></div>
+          <button onClick={() => setDialog({ type: "library" })} title="新建知识库">＋</button>
+        </div>
         <div className="library-list">
           {libraries.map((library) => <button key={library.id} className={`library-item ${activeId === library.id ? "active" : ""}`} onClick={() => chooseLibrary(library.id)}>
             <span className="library-mark">{libraryMark(library)}</span>
-            <span className="library-copy"><b>{library.name}</b><small>{library.policy}</small></span>
-            <span className="library-stats"><b>{library.document_count}</b>{library.unclassified_count > 0 && <i>{library.unclassified_count}</i>}</span>
+            <span className="library-copy"><b>{library.name}</b><small>{library.description || (library.kind === "association" ? "维护不同知识库之间的联系" : "独立保存和管理资料")}</small></span>
+            <span className="library-stats"><b>{library.document_count}<small>份</small></b>{library.unclassified_count > 0 && <i>{library.unclassified_count} 待整理</i>}</span>
           </button>)}
         </div>
-        <div className="rail-health">
-          <span><i className="ok"/>目录版本</span><b>v{treeVersion}</b>
-          <span><i className={jobs.some((job) => job.state === "queued") ? "busy" : "ok"}/>任务队列</span><b>{jobs.length}</b>
-        </div>
-        <p className="rail-note">跨库移动需要建立新的索引修订；同库目录移动只更新过滤元数据。</p>
+        <details className="advanced-section rail-health">
+          <summary>知识库运行信息</summary>
+          <div><span>分类结构版本</span><b>v{treeVersion}</b></div>
+          <div><span>导入任务数量</span><b>{jobs.length}</b></div>
+        </details>
       </aside>
 
       <aside className="taxonomy-pane">
         <header className="taxonomy-head">
-          <div><span className="section-kicker">TAXONOMY</span><h2>{activeLibrary.name}</h2></div>
-          <button onClick={() => setDialog({ type: "node", parentId: selectedNodeId })} title="在当前目录下新建">＋</button>
+          <div><span className="step-chip">第 2 步</span><h2>选择分类</h2><p>当前知识库：{activeLibrary.name}</p></div>
+          <button onClick={() => setDialog({ type: "node", parentId: selectedNodeId })}>新建分类</button>
         </header>
         <div className="taxonomy-tools">
-          <button onClick={() => setExpanded(new Set(allNodes.map((node) => node.id)))}>全部展开</button>
-          <button onClick={() => setExpanded(new Set())}>折叠</button>
-          <button disabled={!selectedNode} onClick={() => { if (selectedNode) { setNodeDraft({ name: selectedNode.name, description: selectedNode.description, kind: selectedNode.kind }); setDialog({ type: "edit-node", node: selectedNode }); } }}>编辑</button>
+          <button onClick={() => setExpanded(new Set(allNodes.map((node) => node.id)))}>展开全部</button>
+          <button onClick={() => setExpanded(new Set())}>全部收起</button>
+          <button disabled={!selectedNode} onClick={() => { if (selectedNode) { setNodeDraft({ name: selectedNode.name, description: selectedNode.description, kind: selectedNode.kind }); setDialog({ type: "edit-node", node: selectedNode }); } }}>修改当前分类</button>
         </div>
         <div className="tree-scroll-v2">
-          {loading ? <div className="kb-empty">正在读取目录…</div> : tree.length > 0 ? <TreeBranch nodes={tree} depth={0} expanded={expanded} selected={selectedNodeId} onToggle={toggleNode} onSelect={setSelectedNodeId} onMove={(source, target) => void moveNode(source, target)}/> : <div className="kb-empty">这个知识库还没有目录</div>}
+          {loading ? <div className="kb-empty">正在读取分类…</div> : tree.length > 0 ? <TreeBranch nodes={tree} depth={0} expanded={expanded} selected={selectedNodeId} onToggle={toggleNode} onSelect={setSelectedNodeId} onMove={(source, target) => void moveNode(source, target)}/> : <div className="kb-empty">这个知识库还没有分类</div>}
         </div>
         <div className="taxonomy-footer">
-          <button onClick={() => setDialog({ type: "node", parentId: selectedNodeId })}>＋ 新建子目录</button>
-          <button className="danger-text" disabled={!selectedNode || selectedNode.is_unclassified} onClick={() => void archiveSelectedNode()}>归档</button>
+          <button onClick={() => setDialog({ type: "node", parentId: selectedNodeId })}>在这里新建下级分类</button>
+          <button className="danger-text" disabled={!selectedNode || selectedNode.is_unclassified} onClick={() => void archiveSelectedNode()}>停用当前分类</button>
         </div>
       </aside>
 
       <main className="document-workspace">
         <header className="document-toolbar">
-          <div>
-            <span className="section-kicker">DOCUMENTS</span>
-            <h2>{selectedNode?.name ?? activeLibrary.name}<small>{documents.length} 项</small></h2>
-          </div>
+          <div><span className="step-chip">第 3 步</span><h2>管理资料 <small>{documents.length} 份</small></h2><p>正在查看：{selectedNode?.name ?? activeLibrary.name}</p></div>
           <div className="document-tools">
-            <select value={statusFilter} onChange={e=>setStatusFilter(e.target.value)}><option value="">全部状态</option><option value="unclassified">未归类</option><option value="active">有效</option><option value="archived">归档</option></select>
-            <label className="document-search"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索当前目录及子目录"/></label>
-            <button onClick={() => void refreshCurrent()} title="刷新">↻</button>
+            <select aria-label="按资料状态筛选" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
+              <option value="">全部资料</option><option value="unclassified">待整理</option><option value="active">正常使用</option><option value="archived">已归档</option>
+            </select>
+            <label className="document-search"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索名称或内容"/></label>
+            <button onClick={() => void refreshCurrent()}>刷新</button>
           </div>
         </header>
 
         {selectedDocuments.size > 0 && <div className="bulk-action-bar">
-          <b>已选择 {selectedDocuments.size} 项</b>
+          <b>已选择 {selectedDocuments.size} 份资料</b>
           <select value={bulkTarget} onChange={(event) => setBulkTarget(event.target.value)}>
-            <option value="">选择目标目录</option>
+            <option value="">要移动到哪个分类？</option>
             {allNodes.filter((node) => node.kind === "physical").map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}
           </select>
-          <button onClick={() => void moveSelectedDocuments()} disabled={!bulkTarget}>移动</button>
-          <button onClick={() => setSelectedDocuments(new Set())}>取消选择</button>
+          <button onClick={() => void moveSelectedDocuments()} disabled={!bulkTarget}>确认移动</button>
+          <button onClick={() => setSelectedDocuments(new Set())}>取消</button>
         </div>}
 
         {proposal && <div className="proposal-banner proposal-banner-v2">
           <span className="proposal-pulse"/>
-          <div><b>AI 提案 · {proposal.status}</b><p>{proposal.items.length} 项建议 · {proposal.approved_count ?? proposal.items.filter((item) => item.status === "approved").length} 项已批准 · {proposal.llm_model || "规则引擎"}</p></div>
-          <button onClick={() => setProposalPanelOpen(true)}>逐项审核</button>
-          <button onClick={() => setProposal(null)}>关闭</button>
+          <div><b>有一组分类建议等待处理</b><p>{proposal.items.length} 条建议，其中 {proposal.approved_count ?? proposal.items.filter((item) => item.status === "approved").length} 条已同意</p></div>
+          <button onClick={() => setProposalPanelOpen(true)}>逐条检查</button>
+          <button onClick={() => setProposal(null)}>稍后处理</button>
         </div>}
 
         <div className="document-table-wrap">
           <table className="document-table">
-            <thead><tr><th className="check-cell"><input type="checkbox" aria-label="选择全部" checked={documents.length > 0 && selectedDocuments.size === documents.length} onChange={(event) => setSelectedDocuments(event.target.checked ? new Set(documents.map((document) => document.id)) : new Set())}/></th><th>名称</th><th>状态</th><th>主目录</th><th>标签</th><th>索引</th><th>更新时间</th></tr></thead>
+            <thead><tr><th className="check-cell"><input type="checkbox" aria-label="选择全部资料" checked={documents.length > 0 && selectedDocuments.size === documents.length} onChange={(event) => setSelectedDocuments(event.target.checked ? new Set(documents.map((document) => document.id)) : new Set())}/></th><th>资料名称</th><th>使用状态</th><th>所在分类</th><th>是否可搜索</th><th>最近更新</th></tr></thead>
             <tbody>
               {documents.map((document) => <tr key={document.id} className={focusedDocument?.id === document.id ? "focused" : ""} onClick={() => void focusDocument(document)}>
                 <td className="check-cell" onClick={(event) => event.stopPropagation()}><input type="checkbox" aria-label={`选择 ${document.title}`} checked={selectedDocuments.has(document.id)} onChange={(event) => setSelectedDocuments((current) => { const next = new Set(current); if (event.target.checked) next.add(document.id); else next.delete(document.id); return next; })}/></td>
-                <td><div className="document-name"><span>{document.mime_type.includes("pdf") ? "PDF" : document.mime_type.includes("json") ? "{}" : "MD"}</span><p><b>{document.title}</b><small>{document.source_name || document.source_path || "手动记录"}</small></p></div></td>
-                <td><span className={`status-pill status-${document.status}`}>{document.status === "unclassified" ? "未归类" : document.status === "active" ? "有效" : document.status === "archived" ? "归档" : "回收站"}</span></td>
-                <td>{document.primary_node_name ?? "—"}</td>
-                <td><div className="tag-stack">{document.tags.slice(0, 2).map((tag) => <span key={tag.id}>{tag.name}</span>)}{document.tags.length > 2 && <i>+{document.tags.length - 2}</i>}</div></td>
-                <td><span className={`index-dot index-${document.index_status}`}/>{document.index_status}</td>
+                <td><div className="document-name"><span>{document.mime_type.includes("pdf") ? "PDF" : document.mime_type.includes("json") ? "数据" : "文档"}</span><p><b>{document.title}</b><small>{document.source_name || "手动创建"}</small></p></div></td>
+                <td><span className={`status-pill status-${document.status}`}>{documentStatusLabel(document.status)}</span></td>
+                <td>{document.primary_node_name ?? "尚未分类"}</td>
+                <td><span className={`index-dot index-${document.index_status}`}/>{indexStatusLabel(document.index_status)}</td>
                 <td>{formatTime(document.updated_at)}</td>
               </tr>)}
-              {documents.length === 0 && <tr><td colSpan={7}><div className="document-empty"><span>◇</span><b>当前范围没有文档</b><p>可从下方摄取文件，或选择另一个目录。</p></div></td></tr>}
+              {documents.length === 0 && <tr><td colSpan={6}><div className="document-empty"><span>◇</span><b>这里还没有资料</b><p>可以在页面下方导入文件，或换一个分类查看。</p></div></td></tr>}
             </tbody>
           </table>
         </div>
@@ -948,90 +1036,110 @@ export function KnowledgeWorkbench({
 
       <aside className="detail-drawer detail-drawer-v2">
         {focusedDocument ? <>
-          <header><span className="section-kicker">DOCUMENT INSPECTOR</span><h2>{focusedDocument.title}</h2><p>{focusedDocument.source_path || "手动创建的知识记录"}</p></header>
+          <header><span className="step-chip">资料详情</span><h2>{focusedDocument.title}</h2><p>在这里修改名称、状态、标签和历史版本。</p></header>
           <div className="inspector-status-row">
-            <label><span>生命周期</span><select value={focusedDocument.status} onChange={(event) => void updateFocusedDocument({ status: event.target.value })}><option value="unclassified">未归类</option><option value="active">有效</option><option value="archived">归档</option><option value="trash">回收站</option></select></label>
-            <label><span>索引状态</span><b>{focusedDocument.index_status}</b></label>
+            <label><span>资料状态</span><select value={focusedDocument.status} onChange={(event) => void updateFocusedDocument({ status: event.target.value })}><option value="unclassified">待整理</option><option value="active">正常使用</option><option value="archived">已归档</option><option value="trash">移到回收站</option></select></label>
+            <label><span>是否可搜索</span><b>{indexStatusLabel(focusedDocument.index_status)}</b></label>
           </div>
-          <dl className="drawer-meta">
-            <div><dt>Document ID</dt><dd><code>{focusedDocument.id}</code></dd></div>
-            <div><dt>主归属</dt><dd>{focusedDocument.primary_node_name ?? "—"}</dd></div>
-            <div><dt>版本</dt><dd>rev {focusedDocument.revision}</dd></div>
-            <div><dt>内容哈希</dt><dd><code>{focusedDocument.content_hash || "尚未计算"}</code></dd></div>
+          <dl className="drawer-meta simple-meta">
+            <div><dt>所在分类</dt><dd>{focusedDocument.primary_node_name ?? "尚未分类"}</dd></div>
+            <div><dt>负责人</dt><dd>{focusedDocument.owner || "未填写"}</dd></div>
+            <div><dt>最近更新</dt><dd>{formatTime(focusedDocument.updated_at)}</dd></div>
           </dl>
-          <section className="drawer-section document-editor"><h3>属性与元数据</h3><input value={documentDraft.title} onChange={e=>setDocumentDraft({...documentDraft,title:e.target.value})}/><input value={documentDraft.owner} onChange={e=>setDocumentDraft({...documentDraft,owner:e.target.value})}/><textarea value={documentDraft.metadata} onChange={e=>setDocumentDraft({...documentDraft,metadata:e.target.value})}/><button onClick={()=>void saveDocumentDetails()}>保存</button></section><section className="drawer-section"><h3>标签</h3>{tags.map(t=><label key={t.id}><input type="checkbox" checked={focusedDocument.tags.some(x=>x.id===t.id)} onChange={()=>void toggleTag(t.id)}/>{t.name}</label>)}</section>
-          <section className="drawer-section"><h3>目录别名</h3>{focusedDocument.aliases.map(a=><span key={a.id}>{a.name}<button onClick={()=>void removeAlias(a.id)}>×</button></span>)}<div className="inline-editor"><select value={aliasTarget} onChange={e=>setAliasTarget(e.target.value)}><option value="">选择目录</option>{allNodes.filter(n=>n.kind==="physical").map(n=><option key={n.id} value={n.id}>{n.name}</option>)}</select><button onClick={()=>void addAlias()}>引用</button></div><div className="inline-editor"><input value={tagDraft} onChange={e=>setTagDraft(e.target.value)} placeholder="新标签"/><button onClick={()=>void createAndAssignTag()}>添加标签</button></div></section><section className="drawer-section"><h3>版本时间线</h3>{documentVersions.map(v=><article key={v.id}><b>v{v.version_number} · {v.index_status}</b>{focusedDocument.current_version_id===v.id?<strong>当前</strong>:v.index_status==="ready"&&<button onClick={()=>void activateDocumentVersion(v.id)}>切换</button>}</article>)}</section>
+          <section className="drawer-section document-editor">
+            <h3>基本信息</h3>
+            <label><span>资料名称</span><input value={documentDraft.title} onChange={(event) => setDocumentDraft({ ...documentDraft, title: event.target.value })}/></label>
+            <label><span>负责人</span><input value={documentDraft.owner} onChange={(event) => setDocumentDraft({ ...documentDraft, owner: event.target.value })} placeholder="可留空"/></label>
+            <button onClick={() => void saveDocumentDetails()}>保存修改</button>
+          </section>
+          <section className="drawer-section">
+            <h3>标签</h3>
+            <div className="tag-choice-list">{tags.map((tag) => <label key={tag.id}><input type="checkbox" checked={focusedDocument.tags.some((current) => current.id === tag.id)} onChange={() => void toggleTag(tag.id)}/><span>{tag.name}</span></label>)}{tags.length === 0 && <p>还没有标签</p>}</div>
+            <div className="inline-editor"><input value={tagDraft} onChange={(event) => setTagDraft(event.target.value)} placeholder="输入新标签名称"/><button onClick={() => void createAndAssignTag()}>新增</button></div>
+          </section>
+          <section className="drawer-section">
+            <h3>同时显示在其他分类</h3>
+            <p className="section-help">资料不会被复制，只会增加一个方便查找的入口。</p>
+            <div className="alias-list">{focusedDocument.aliases.map((alias) => <span key={alias.id}>{alias.name}<button aria-label={`移除 ${alias.name}`} onClick={() => void removeAlias(alias.id)}>×</button></span>)}</div>
+            <div className="inline-editor"><select value={aliasTarget} onChange={(event) => setAliasTarget(event.target.value)}><option value="">选择另一个分类</option>{allNodes.filter((node) => node.kind === "physical").map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}</select><button onClick={() => void addAlias()}>添加入口</button></div>
+          </section>
+          <section className="drawer-section">
+            <h3>历史版本</h3>
+            <div className="version-list">{documentVersions.map((version) => <article key={version.id}><div><b>第 {version.version_number} 版</b><small>{formatTime(version.created_at)} · {indexStatusLabel(version.index_status)}</small></div>{focusedDocument.current_version_id === version.id ? <strong>当前使用</strong> : version.index_status === "ready" && <button onClick={() => void activateDocumentVersion(version.id)}>改用此版本</button>}</article>)}{documentVersions.length === 0 && <p>暂无历史版本</p>}</div>
+          </section>
+          <details className="advanced-section">
+            <summary>高级信息</summary>
+            <dl className="drawer-meta"><div><dt>资料标识</dt><dd><code>{focusedDocument.id}</code></dd></div><div><dt>编辑版本</dt><dd>{focusedDocument.revision}</dd></div><div><dt>内容校验值</dt><dd><code>{focusedDocument.content_hash || "尚未生成"}</code></dd></div><div><dt>原始位置</dt><dd><code>{focusedDocument.source_path || "手动创建"}</code></dd></div></dl>
+            <label className="metadata-editor"><span>自定义信息（JSON）</span><textarea value={documentDraft.metadata} onChange={(event) => setDocumentDraft({ ...documentDraft, metadata: event.target.value })}/><button onClick={() => void saveDocumentMetadata()}>保存自定义信息</button></label>
+          </details>
         </> : selectedNode ? <>
-          <header><span className="section-kicker">NODE INSPECTOR</span><h2>{selectedNode.name}</h2><p>{selectedNode.description || "当前目录没有说明"}</p></header>
-          <dl className="drawer-meta"><div><dt>节点 ID</dt><dd><code>{selectedNode.id}</code></dd></div><div><dt>直接文档</dt><dd>{selectedNode.direct_count}</dd></div><div><dt>子树文档</dt><dd>{selectedNode.subtree_count}</dd></div><div><dt>节点类型</dt><dd>{selectedNode.kind}</dd></div><div><dt>目录版本</dt><dd>v{treeVersion}</dd></div></dl>
-          <section className="drawer-section"><h3>操作提示</h3><ul><li>拖拽目录到另一个目录即可移动分支</li><li>主归属唯一，别名不会复制向量</li><li>归档分支会把文档移入未归类</li></ul></section>
-          <section className="drawer-section relation-preview"><h3>最近审计</h3>{audit.slice(0, 4).map((event) => <p key={event.id}><span>{formatTime(event.created_at)}</span>{event.action} · {event.target_type}</p>)}{audit.length === 0 && <small>暂无审计事件</small>}</section>
-        </> : <div className="kb-empty">请选择一个目录或文档</div>}
+          <header><span className="step-chip">分类详情</span><h2>{selectedNode.name}</h2><p>{selectedNode.description || "还没有填写这个分类的用途说明。"}</p></header>
+          <dl className="drawer-meta simple-meta"><div><dt>本层资料</dt><dd>{selectedNode.direct_count} 份</dd></div><div><dt>包含下级分类</dt><dd>{selectedNode.subtree_count} 份</dd></div><div><dt>分类方式</dt><dd>{nodeKindLabel(selectedNode.kind)}</dd></div></dl>
+          <section className="drawer-section"><h3>你可以这样操作</h3><ul className="plain-guidance"><li>拖动一个分类到另一个分类，可调整层级。</li><li>同一份资料可在其他分类增加查找入口。</li><li>停用分类后，其中资料会回到“待整理”。</li></ul></section>
+          <section className="drawer-section relation-preview"><h3>最近操作</h3>{audit.slice(0, 4).map((event) => <p key={event.id}><span>{formatTime(event.created_at)}</span>{auditActionLabel(event.action)}</p>)}{audit.length === 0 && <small>还没有操作记录</small>}</section>
+          <details className="advanced-section"><summary>高级信息</summary><dl className="drawer-meta"><div><dt>分类标识</dt><dd><code>{selectedNode.id}</code></dd></div><div><dt>分类结构版本</dt><dd>v{treeVersion}</dd></div></dl></details>
+        </> : <div className="kb-empty">请选择一个分类或一份资料</div>}
       </aside>
     </section>}
 
-    {managementView==="browse"&&activeLibrary.kind !== "association" && <section className="ingest-dock ingest-dock-v2">
-      <div><span className="section-kicker">PERSISTENT INGEST QUEUE</span><h2>摄取文件或扫描目录</h2><p>路径必须位于服务端 `RAG_INGEST_ROOTS` 允许范围。任务写入 SQLite，不再制造零向量知识块。</p></div>
-      <label><span>WSL 文件或目录路径</span><input value={ingestPath} onChange={(event) => setIngestPath(event.target.value)}/></label>
-      <label><span>目标目录</span><select value={selectedNodeId ?? ""} onChange={(event) => setSelectedNodeId(event.target.value)}>{allNodes.filter((node) => node.kind === "physical").map((node) => <option value={node.id} key={node.id}>{node.name}</option>)}</select></label>
-      <button className="primary-button compact" onClick={() => void enqueueIngest()}>加入任务队列</button>
+    {managementView === "browse" && activeLibrary.kind !== "association" && <section className="ingest-dock ingest-dock-v2">
+      <div><span className="step-chip">导入新资料</span><h2>添加文件或文件夹</h2><p>提交后会在后台处理。你可以离开此页，再到“导入进度”查看结果。</p></div>
+      <label><span>文件或文件夹位置</span><input value={ingestPath} onChange={(event) => setIngestPath(event.target.value)}/><small>位置必须在资料服务允许读取的范围内。</small></label>
+      <label><span>放入哪个分类</span><select value={selectedNodeId ?? ""} onChange={(event) => setSelectedNodeId(event.target.value)}>{allNodes.filter((node) => node.kind === "physical").map((node) => <option value={node.id} key={node.id}>{node.name}</option>)}</select></label>
+      <button className="primary-button compact" onClick={() => void enqueueIngest()}>开始导入</button>
     </section>}
-    {managementView==="jobs"&&<section className="governance-panel"><h2>摄取任务中心</h2>{jobs.map(j=><article key={j.id}>{j.source_path} · {j.state} · {j.progress}% <button onClick={()=>void actOnJob(j.id,j.state==="queued"?"cancel":"retry")}>{j.state==="queued"?"取消":"重试"}</button><small>{j.error}</small></article>)}</section>}
-    {managementView==="audit"&&<section className="governance-panel"><h2>变更审计</h2>{audit.map(e=><article key={e.id}>{formatTime(e.created_at)} · {e.action} · {e.actor}</article>)}</section>}
-    {managementView==="associations"&&<section className="governance-panel"><h2>潜在关联治理</h2><form className="edge-composer" onSubmit={createKnowledgeEdge}><select value={edgeDraft.source} onChange={e=>setEdgeDraft({...edgeDraft,source:e.target.value})}>{edgeDocuments.map(d=><option key={d.id} value={d.id}>{d.title}</option>)}</select><select value={edgeDraft.target} onChange={e=>setEdgeDraft({...edgeDraft,target:e.target.value})}>{edgeDocuments.map(d=><option key={d.id} value={d.id}>{d.title}</option>)}</select><button>建立关联</button></form>{edges.map(e=><article key={e.id}>{e.source_title} ↔ {e.target_title}<button onClick={()=>void updateKnowledgeEdge(e,"confirmed")}>确认</button></article>)}</section>}
+
+    {managementView === "jobs" && <section className="governance-panel">
+      <header><div><span className="section-kicker">处理过程</span><h2>导入进度</h2><p>查看每批资料是否已成功加入知识库。</p></div><button className="outline-button" onClick={() => void loadSideData(activeId)}>刷新</button></header>
+      <div className="governance-list">{jobs.map((job) => { const canCancel = job.state === "queued" || job.state === "running"; return <article className="job-card" key={job.id}><div className="job-main"><b>{job.source_path.split(/[\\/]/).filter(Boolean).pop() || job.source_path}</b><p>{job.source_path}</p><div className="job-progress"><i style={{ width: `${Math.max(0, Math.min(100, job.progress))}%` }}/></div></div><div className="job-state"><strong>{jobStatusLabel(job.state)}</strong><span>{job.progress}%</span></div><button onClick={() => void actOnJob(job.id, canCancel ? "cancel" : "retry")}>{canCancel ? "取消导入" : "重新尝试"}</button>{job.error && <p className="job-error">失败原因：{job.error}</p>}<details className="advanced-section"><summary>任务信息</summary><code>{job.id}</code></details></article>; })}{jobs.length === 0 && <div className="kb-empty">目前没有导入任务</div>}</div>
+    </section>}
+
+    {managementView === "audit" && <section className="governance-panel">
+      <header><div><span className="section-kicker">可以追溯和检查</span><h2>操作记录</h2><p>重要的新增、移动、修改和撤销都会留在这里。</p></div></header>
+      <div className="audit-list">{audit.map((event) => <article key={event.id}><time>{formatTime(event.created_at)}</time><div><b>{auditActionLabel(event.action)}</b><p>{event.actor ? `操作人：${event.actor}` : "由系统记录"}</p></div><details className="advanced-section"><summary>详细信息</summary><code>{event.target_type} · {event.target_id || "—"}</code></details></article>)}{audit.length === 0 && <div className="kb-empty">目前没有操作记录</div>}</div>
+    </section>}
+
+    {managementView === "associations" && <section className="governance-panel association-panel">
+      <header><div><span className="section-kicker">连接不同知识库</span><h2>跨库关联</h2><p>记录两份资料之间的支持、冲突或其他潜在联系，供后续推理使用。</p></div></header>
+      <form className="edge-composer" onSubmit={createKnowledgeEdge}>
+        <label><span>第一份资料</span><select required value={edgeDraft.source} onChange={(event) => setEdgeDraft({ ...edgeDraft, source: event.target.value })}><option value="">请选择</option>{edgeDocuments.map((document) => <option key={document.id} value={document.id}>{document.title}</option>)}</select></label>
+        <label><span>它与第二份资料</span><select value={edgeDraft.relation} onChange={(event) => setEdgeDraft({ ...edgeDraft, relation: event.target.value })}><option value="related">存在联系</option><option value="supports">相互支持</option><option value="contradicts">存在冲突</option><option value="extends">可以互相补充</option></select></label>
+        <label><span>第二份资料</span><select required value={edgeDraft.target} onChange={(event) => setEdgeDraft({ ...edgeDraft, target: event.target.value })}><option value="">请选择</option>{edgeDocuments.map((document) => <option key={document.id} value={document.id}>{document.title}</option>)}</select></label>
+        <label><span>把握程度</span><select value={edgeDraft.confidence} onChange={(event) => setEdgeDraft({ ...edgeDraft, confidence: event.target.value })}><option value="0.5">可能有关</option><option value="0.7">较有把握</option><option value="0.9">非常确定</option></select></label>
+        <button className="primary-button">保存关联</button>
+      </form>
+      <div className="edge-list">{edges.map((edge) => <article key={edge.id}><div><b>{edge.source_title}</b><span>↔</span><b>{edge.target_title}</b><p>把握程度 {Math.round(edge.confidence * 100)}%</p></div><span className={`status-pill status-${edge.status}`}>{edge.status === "candidate" ? "等待确认" : edge.status === "confirmed" ? "已经确认" : "不采用"}</span>{edge.status === "candidate" && <div><button onClick={() => void updateKnowledgeEdge(edge, "confirmed")}>确认保留</button><button onClick={() => void updateKnowledgeEdge(edge, "rejected")}>不采用</button></div>}</article>)}{edges.length === 0 && <div className="kb-empty">还没有建立跨库关联</div>}</div>
+    </section>}
 
     {proposalPanelOpen && <div className="proposal-review-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setProposalPanelOpen(false); }}>
-      <section className="proposal-review-panel" role="dialog" aria-modal="true" aria-label="AI 分类提案审核">
+      <section className="proposal-review-panel" role="dialog" aria-modal="true" aria-label="检查智能分类建议">
         <header className="proposal-review-head">
-          <div><span className="section-kicker">VERSION-LOCKED AI PROPOSALS</span><h2>AI 分类提案审核</h2><p>每项单独批准或拒绝；应用前会再次检查文档版本、修订号和目录位置。</p></div>
-          <button onClick={() => setProposalPanelOpen(false)} aria-label="关闭提案审核">×</button>
+          <div><span className="section-kicker">由你作最后决定</span><h2>检查智能分类建议</h2><p>可以逐条修改、同意或拒绝。真正执行前，系统还会检查资料是否已被别人改动。</p></div>
+          <button onClick={() => setProposalPanelOpen(false)} aria-label="关闭分类建议">×</button>
         </header>
         <div className="proposal-review-layout">
           <aside className="proposal-history">
-            <div className="proposal-history-head"><b>提案历史</b><button onClick={() => void requestClassification()} disabled={proposalLoading}>＋ 新建</button></div>
-            {proposals.map((entry) => <button key={entry.id} className={proposal?.id === entry.id ? "active" : ""} onClick={() => void loadProposal(entry.id)}>
-              <span><b>{entry.llm_model || "classifier"}</b><i className={`proposal-status status-${entry.status}`}>{entry.status}</i></span>
-              <small>{formatTime(entry.created_at)} · {entry.item_count} 项 · {entry.approved_count} 已批准</small>
-            </button>)}
-            {proposals.length === 0 && <div className="proposal-history-empty">尚无持久化提案。<br/>点击“新建”扫描未归类文件。</div>}
+            <div className="proposal-history-head"><b>建议记录</b><button onClick={() => void requestClassification()} disabled={proposalLoading}>新建一组</button></div>
+            {proposals.map((entry) => <button key={entry.id} className={proposal?.id === entry.id ? "active" : ""} onClick={() => void loadProposal(entry.id)}><span><b>{formatTime(entry.created_at)}</b><i className={`proposal-status status-${entry.status}`}>{proposalStatusLabel(entry.status)}</i></span><small>{entry.item_count} 条建议 · {entry.approved_count} 条已同意</small></button>)}
+            {proposals.length === 0 && <div className="proposal-history-empty">还没有分类建议。<br/>点击“新建一组”分析待整理资料。</div>}
           </aside>
           <main className="proposal-review-main">
-            {proposalLoading && !proposal ? <div className="kb-empty">正在读取提案…</div> : proposal ? <>
-              <div className="proposal-summary">
-                <div><small>提案状态</small><b>{proposal.status}</b></div>
-                <div><small>分类器</small><b>{proposal.llm_model || "unknown"}</b></div>
-                <div><small>待审核</small><b>{proposal.items.filter((item) => item.status === "pending").length}</b></div>
-                <div><small>Token</small><b>{(proposal.prompt_tokens ?? 0) + (proposal.completion_tokens ?? 0)}</b></div>
-              </div>
+            {proposalLoading && !proposal ? <div className="kb-empty">正在读取建议…</div> : proposal ? <>
+              <div className="proposal-summary"><div><small>当前状态</small><b>{proposalStatusLabel(proposal.status)}</b></div><div><small>建议总数</small><b>{proposal.items.length}</b></div><div><small>等待确认</small><b>{proposal.items.filter((item) => item.status === "pending").length}</b></div><div><small>已经同意</small><b>{proposal.items.filter((item) => item.status === "approved").length}</b></div></div>
               <div className="proposal-item-list">
                 {proposal.items.map((item, index) => {
                   const versionConflict = item.live_version_id !== undefined && item.live_version_id !== item.version_id;
                   const busy = proposalAction.endsWith(item.id);
                   return <article className={`proposal-item-card item-${item.status} ${versionConflict ? "has-conflict" : ""}`} key={item.id}>
-                    <div className="proposal-item-index">{String(index + 1).padStart(2, "0")}</div>
-                    <div className="proposal-item-copy">
-                      <header><b>{item.document_title || item.document_source_name || item.document_id}</b><span>{Math.round(item.confidence * 100)}%</span></header>
-                      <p><span>{item.source_node_name || item.source_node_id}</span><i>→</i><strong>{item.target_node_name || item.target_node_id}</strong></p>
-                      <small>{item.llm_reasoning || item.reason_code || "分类器未提供额外说明"}</small>
-                      {versionConflict && <em>版本冲突：文档已在提案生成后更新，必须重新生成提案。</em>}
-                      {item.status==="pending"&&<select value={item.target_node_id} onChange={e=>void retargetProposalItem(item.id,e.target.value)}>{allNodes.filter(n=>n.kind==="physical"&&!n.is_unclassified).map(n=><option key={n.id} value={n.id}>{n.name}</option>)}</select>}
-                    </div>
-                    <div className="proposal-item-actions">
-                      <i className={`proposal-status status-${item.status}`}>{item.status}</i>
-                      {item.status === "pending" && <>
-                        <button className="approve" disabled={busy || versionConflict} onClick={() => void reviewProposalItem(item.id, "approve")}>{busy ? "处理中" : "批准"}</button>
-                        <button className="reject" disabled={busy} onClick={() => void reviewProposalItem(item.id, "reject")}>拒绝</button>
-                      </>}
-                    </div>
+                    <div className="proposal-item-index">{index + 1}</div>
+                    <div className="proposal-item-copy"><header><b>{item.document_title || item.document_source_name || "未命名资料"}</b><span>把握度 {Math.round(item.confidence * 100)}%</span></header><p><span>{item.source_node_name || "待整理"}</span><i>移到</i><strong>{item.target_node_name || "建议分类"}</strong></p><small>{item.llm_reasoning || "助手未提供额外说明"}</small>{versionConflict && <em>这份资料后来被修改过，需要重新生成建议。</em>}{item.status === "pending" && <label className="proposal-target"><span>改放到</span><select value={item.target_node_id} onChange={(event) => void retargetProposalItem(item.id, event.target.value)}>{allNodes.filter((node) => node.kind === "physical" && !node.is_unclassified).map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}</select></label>}</div>
+                    <div className="proposal-item-actions"><i className={`proposal-status status-${item.status}`}>{proposalStatusLabel(item.status)}</i>{item.status === "pending" && <><button className="approve" disabled={busy || versionConflict} onClick={() => void reviewProposalItem(item.id, "approve")}>{busy ? "处理中…" : "同意这样分类"}</button><button className="reject" disabled={busy} onClick={() => void reviewProposalItem(item.id, "reject")}>不采用</button></>}</div>
                   </article>;
                 })}
-                {proposal.items.length === 0 && <div className="kb-empty">分类器没有生成可审核项；请检查校验日志或调整目录说明。</div>}
+                {proposal.items.length === 0 && <div className="kb-empty">没有生成可确认的建议。可以补充分类用途说明后再试。</div>}
               </div>
-              <footer className="proposal-review-footer">
-                <p>应用操作是单个 SQLite 事务；任意一项过期，整个批次都不会移动。</p>
-                {proposal.status === "applied" ? <button className="outline-button" disabled={proposalAction === "revert"} onClick={() => void transitionProposal("revert")}>{proposalAction === "revert" ? "撤销校验中…" : "安全撤销"}</button> : <button className="primary-button compact" disabled={proposalAction === "apply" || !proposal.items.some((item) => item.status === "approved")} onClick={() => void transitionProposal("apply")}>{proposalAction === "apply" ? "冲突校验与应用中…" : "应用所有已批准项"}</button>}
-              </footer>
-            </> : <div className="kb-empty">从左侧选择一个提案，或新建分类提案。</div>}
+              <footer className="proposal-review-footer"><p>执行时会整组检查；只要有一份资料发生变化，就不会移动任何资料。</p>{proposal.status === "applied" ? <button className="outline-button" disabled={proposalAction === "revert"} onClick={() => void transitionProposal("revert")}>{proposalAction === "revert" ? "正在撤销…" : "撤销这组操作"}</button> : <button className="primary-button compact" disabled={proposalAction === "apply" || !proposal.items.some((item) => item.status === "approved")} onClick={() => void transitionProposal("apply")}>{proposalAction === "apply" ? "正在执行…" : "执行已同意的建议"}</button>}<details className="advanced-section proposal-technical"><summary>本次分析信息</summary><p>使用模型：{proposal.llm_model || "未记录"} · 用量：{(proposal.prompt_tokens ?? 0) + (proposal.completion_tokens ?? 0)} tokens</p></details></footer>
+            </> : <div className="kb-empty">从左侧选择一组建议，或新建一组。</div>}
           </main>
         </div>
       </section>
@@ -1039,18 +1147,25 @@ export function KnowledgeWorkbench({
 
     {dialog && <div className="kb-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setDialog(null); }}>
       {dialog.type === "library" ? <form className="kb-modal" onSubmit={createLibrary}>
-        <header><div><span className="section-kicker">NEW LIBRARY</span><h2>创建独立知识库</h2></div><button type="button" onClick={() => setDialog(null)}>×</button></header>
-        <label><span>名称</span><input required value={libraryDraft.name} onChange={(event) => setLibraryDraft({ ...libraryDraft, name: event.target.value })} placeholder="例如：工程资料"/></label>
-        <label><span>稳定 ID（可留空）</span><input value={libraryDraft.id} onChange={(event) => setLibraryDraft({ ...libraryDraft, id: event.target.value.toLowerCase() })} placeholder="engineering" pattern="[a-z0-9][a-z0-9-]{1,62}"/></label>
-        <label><span>类型</span><select value={libraryDraft.kind} onChange={(event) => setLibraryDraft({ ...libraryDraft, kind: event.target.value })}><option value="document">文档库</option><option value="association">关联库</option></select></label>
-        <label><span>用途说明</span><textarea value={libraryDraft.description} onChange={(event) => setLibraryDraft({ ...libraryDraft, description: event.target.value })}/></label>
+        <header><div><span className="section-kicker">按用途分开管理</span><h2>新建知识库</h2></div><button type="button" onClick={() => setDialog(null)} aria-label="关闭">×</button></header>
+        <label><span>知识库名称</span><input required value={libraryDraft.name} onChange={(event) => setLibraryDraft({ ...libraryDraft, name: event.target.value })} placeholder="例如：工程资料"/></label>
+        <label><span>用途</span><select value={libraryDraft.kind} onChange={(event) => setLibraryDraft({ ...libraryDraft, kind: event.target.value })}><option value="document">保存和搜索资料</option><option value="association">维护不同知识库之间的联系</option></select></label>
+        <label><span>用途说明</span><textarea value={libraryDraft.description} onChange={(event) => setLibraryDraft({ ...libraryDraft, description: event.target.value })} placeholder="这里主要保存哪些资料？谁会使用？"/></label>
+        <details className="advanced-section"><summary>高级设置</summary><label><span>技术标识（可留空自动生成）</span><input value={libraryDraft.id} onChange={(event) => setLibraryDraft({ ...libraryDraft, id: event.target.value.toLowerCase() })} placeholder="engineering" pattern="[a-z0-9][a-z0-9-]{1,62}"/></label></details>
         <footer><button type="button" onClick={() => setDialog(null)}>取消</button><button className="primary-button" type="submit">创建知识库</button></footer>
-      </form> : dialog.type==="library-settings"?<form className="kb-modal" onSubmit={saveLibrarySettings}><h2>知识库设置</h2><input value={librarySettings.name} onChange={e=>setLibrarySettings({...librarySettings,name:e.target.value})}/><input value={librarySettings.policy} onChange={e=>setLibrarySettings({...librarySettings,policy:e.target.value})}/><textarea value={librarySettings.description} onChange={e=>setLibrarySettings({...librarySettings,description:e.target.value})}/><button>保存</button></form>: <form className="kb-modal" onSubmit={submitNode}>
-        <header><div><span className="section-kicker">{dialog.type === "node" ? "NEW NODE" : "EDIT NODE"}</span><h2>{dialog.type === "node" ? "创建目录" : `编辑 ${dialog.node.name}`}</h2></div><button type="button" onClick={() => setDialog(null)}>×</button></header>
-        <label><span>目录名称</span><input required value={nodeDraft.name} onChange={(event) => setNodeDraft({ ...nodeDraft, name: event.target.value })}/></label>
-        <label><span>节点类型</span><select value={nodeDraft.kind} onChange={(event) => setNodeDraft({ ...nodeDraft, kind: event.target.value })}><option value="physical">实体目录</option><option value="smart">智能目录</option><option value="alias">目录快捷入口</option></select></label>
-        <label><span>用途与分类边界</span><textarea value={nodeDraft.description} onChange={(event) => setNodeDraft({ ...nodeDraft, description: event.target.value })} placeholder="说明哪些内容应该进入这里"/></label>
-        <footer><button type="button" onClick={() => setDialog(null)}>取消</button><button className="primary-button" type="submit">保存目录</button></footer>
+      </form> : dialog.type === "library-settings" ? <form className="kb-modal" onSubmit={saveLibrarySettings}>
+        <header><div><span className="section-kicker">当前知识库</span><h2>知识库设置</h2></div><button type="button" onClick={() => setDialog(null)} aria-label="关闭">×</button></header>
+        <label><span>名称</span><input value={librarySettings.name} onChange={(event) => setLibrarySettings({ ...librarySettings, name: event.target.value })}/></label>
+        <label><span>用途说明</span><textarea value={librarySettings.description} onChange={(event) => setLibrarySettings({ ...librarySettings, description: event.target.value })}/></label>
+        <label><span>使用状态</span><select value={librarySettings.status} onChange={(event) => setLibrarySettings({ ...librarySettings, status: event.target.value })}><option value="active">正常使用</option><option value="archived">停止使用</option></select></label>
+        <details className="advanced-section"><summary>高级设置</summary><label><span>整理规则</span><input value={librarySettings.policy} onChange={(event) => setLibrarySettings({ ...librarySettings, policy: event.target.value })}/></label></details>
+        <footer><button type="button" onClick={() => setDialog(null)}>取消</button><button className="primary-button" type="submit">保存设置</button></footer>
+      </form> : <form className="kb-modal" onSubmit={submitNode}>
+        <header><div><span className="section-kicker">建立清晰的层级</span><h2>{dialog.type === "node" ? "新建分类" : `修改“${dialog.node.name}”`}</h2></div><button type="button" onClick={() => setDialog(null)} aria-label="关闭">×</button></header>
+        <label><span>分类名称</span><input required value={nodeDraft.name} onChange={(event) => setNodeDraft({ ...nodeDraft, name: event.target.value })}/></label>
+        <label><span>分类方式</span><select value={nodeDraft.kind} onChange={(event) => setNodeDraft({ ...nodeDraft, kind: event.target.value })}><option value="physical">普通分类</option><option value="smart">按条件自动筛选</option><option value="alias">其他分类的快捷入口</option></select></label>
+        <label><span>用途说明</span><textarea value={nodeDraft.description} onChange={(event) => setNodeDraft({ ...nodeDraft, description: event.target.value })} placeholder="说明哪些资料应该放在这里，哪些不应该。"/></label>
+        <footer><button type="button" onClick={() => setDialog(null)}>取消</button><button className="primary-button" type="submit">保存分类</button></footer>
       </form>}
     </div>}
   </div>;

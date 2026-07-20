@@ -153,11 +153,11 @@ const demoResults: SearchResult[] = [
 ];
 
 const navItems: { id: View; label: string; sub: string; icon: IconName }[] = [
-  { id: "search", label: "检索", sub: "混合召回", icon: "search" },
-  { id: "library", label: "知识库", sub: "分类与关联", icon: "book" },
-  { id: "memory", label: "上下文", sub: "会话记忆", icon: "message" },
-  { id: "status", label: "服务状态", sub: "运行与延迟", icon: "pulse" },
-  { id: "settings", label: "设置", sub: "端点与模型", icon: "settings" },
+  { id: "search", label: "知识检索", sub: "查资料、整理回答", icon: "search" },
+  { id: "library", label: "知识库管理", sub: "整理分类和资料", icon: "book" },
+  { id: "memory", label: "长期记忆", sub: "保存重要事实和决定", icon: "message" },
+  { id: "status", label: "运行状态", sub: "检查和重启服务", icon: "pulse" },
+  { id: "settings", label: "系统设置", sub: "连接地址和显示方式", icon: "settings" },
 ];
 
 type IconName = "search" | "book" | "message" | "pulse" | "settings" | "quote" | "path" | "plus" | "trash" | "check" | "arrow" | "spark" | "copy" | "sun" | "moon" | "restart";
@@ -539,9 +539,9 @@ export default function Home() {
     >
       <DeepSpaceBackdrop active={settings.theme === "night"} overlay={settings.syntheticOverlay} imageUrl={skyFrame.imageUrl} density={settings.stellarDensity} limitingMagnitude={settings.limitingMagnitude} twinkle={settings.twinkleStrength}/>
       <aside className="sidebar">
-        <div className="brand" aria-label="宙合 RAG 检索工作台">
+        <div className="brand" aria-label="宙合知识管理工作台">
           <span className="brand-seal">宙</span>
-          <span className="brand-copy"><b>宙合</b><small>RAG CONSOLE</small></span>
+          <span className="brand-copy"><b>宙合</b><small>知识检索与管理</small></span>
         </div>
         <nav aria-label="主导航">
           {navItems.map((item) => (
@@ -561,7 +561,7 @@ export default function Home() {
         <header className="topbar">
           <div className="mobile-brand"><span className="brand-seal">宙</span><b>宙合</b></div>
           <div className="service-strip">
-            {([ ["weaviate", "Weaviate", "1.38"], ["gateway", "BGE-M3", "内置"], ["llm", "Gemma", "31B Q4"] ] as [ServiceKey, string, string][]).map(([key, label, meta]) => (
+            {([ ["weaviate", "资料索引", "运行服务"], ["gateway", "资料理解", "内置"], ["llm", "本地回答", "运行服务"] ] as [ServiceKey, string, string][]).map(([key, label, meta]) => (
               <div key={key} className="service-pill-wrapper">
                 <button className="service-pill" onClick={() => setView("status")} title={`查看 ${label} 服务状态`}>
                   <span className={`status-dot ${health[key]}`}/><span>{label}</span><small>{meta}</small>
@@ -593,7 +593,7 @@ export default function Home() {
 
         {settings.theme === "night" && <a className="sky-telemetry" href={skyFrame.sourcePage} target="_blank" rel="noreferrer" title={`科学帧 ${skyFrame.dpId}`}>
           <span className={`sky-live-dot ${skyFrame.isFallback ? "fallback" : "live"}`}/>
-          <span><b>{skyFrame.isFallback ? "最近可用夜空" : "每小时实时帧"}</b><small>{skyFrame.instrument} · Paranal · {skyCapturedLabel} UTC</small></span>
+          <span><b>{skyFrame.isFallback ? "最近可用夜空" : "每小时实拍夜空"}</b><small>{skyFrame.instrument} · 帕拉纳尔 · {skyCapturedLabel}（世界协调时）</small></span>
           <span><b>{skyFrame.sqmZen.toFixed(2)}</b><small>mag/arcsec²</small></span>
           <span><b>{skyFrame.sourceWidth}²</b><small>原始像素</small></span>
         </a>}
@@ -601,7 +601,7 @@ export default function Home() {
         {view === "search" && (
           <div className="page search-page">
             <section className="search-column">
-              <div className="eyebrow"><span/>宙合 · GLOBAL RETRIEVAL</div>
+              <div className="eyebrow"><span/>从你的资料中寻找答案</div>
               <div className="hero-quote-container">
                 <h1 className="hero-quote">「{heroPhrase.text}」</h1>
                 <p className="hero-source">—— {heroPhrase.source}</p>
@@ -623,31 +623,31 @@ export default function Home() {
                     </div>
                   </div>
                   <div className="control-block topk-block">
-                    <label htmlFor="top-k">返回数量</label>
+                    <label htmlFor="top-k">显示几条结果</label>
                     <select id="top-k" value={topK} onChange={(e) => setTopK(Number(e.target.value))}>
-                      {[4, 6, 8, 10].map((n) => <option key={n} value={n}>Top {n}</option>)}
+                      {[4, 6, 8, 10].map((n) => <option key={n} value={n}>{n} 条</option>)}
                     </select>
                   </div>
                 </div>
 
                 <div className="weight-block">
-                  <div className="weight-head"><label htmlFor="alpha">混合检索权重</label><span><b>语义 {alpha}%</b><i>关键词 {100 - alpha}%</i></span></div>
+                  <div className="weight-head"><label htmlFor="alpha">更看重哪种匹配方式</label><span><b>理解意思 {alpha}%</b><i>匹配原词 {100 - alpha}%</i></span></div>
                   <input id="alpha" type="range" min="0" max="100" value={alpha} onChange={(e) => setAlpha(Number(e.target.value))} style={{ "--range": `${alpha}%` } as React.CSSProperties}/>
-                  <div className="range-notes"><span>精确术语 / 错误码</span><span>概念 / 语义问题</span></div>
+                  <div className="range-notes"><span>适合文件名、错误码</span><span>适合自然语言问题</span></div>
                 </div>
 
                 <button className="primary-button" disabled={loading} type="submit">{loading ? <span className="loading-mark"/> : <Icon name="arrow"/>}<span>{loading ? "正在检索" : "开始检索"}</span></button>
               </form>
 
               <div className="answer-panel">
-                <div className="answer-head"><div><span className="section-kicker">SYNTHESIS</span><h2>依据整理</h2></div><button onClick={generateAnswer} disabled={answering || !results.length} className="outline-button"><Icon name="spark"/>{answering ? "正在生成" : "整理为回答"}</button></div>
-                {answer ? <p className="answer-text">{answer}</p> : <p className="empty-answer">选择引用片段后，可由本地 llama.cpp Gemma 整理为带出处的回答；不选择时默认使用前三条结果。下一版将由 Gateway 统一完成问题分类、检索与生成。</p>}
+                <div className="answer-head"><div><span className="section-kicker">整理回答</span><h2>根据资料生成回答</h2></div><button onClick={generateAnswer} disabled={answering || !results.length} className="outline-button"><Icon name="spark"/>{answering ? "正在整理" : "生成回答"}</button></div>
+                {answer ? <p className="answer-text">{answer}</p> : <p className="empty-answer">可以先勾选右侧最可信的资料，再点击“生成回答”。如果不选择，系统会默认使用前三条结果。回答由本机模型生成，并保留资料出处。</p>}
               </div>
             </section>
 
             <section className="results-column">
-              <div className="results-head"><div><span className="section-kicker">EVIDENCE</span><h2>检索依据</h2></div><div className="result-count"><b>{results.length}</b><span>条结果</span></div></div>
-              <div className="citation-summary"><span>已选 <b>{selected.length}</b> 条作为回答上下文</span>{selected.length > 0 && <button onClick={() => setSelected([])}>清空</button>}</div>
+              <div className="results-head"><div><span className="section-kicker">找到的资料</span><h2>可用资料</h2></div><div className="result-count"><b>{results.length}</b><span>条结果</span></div></div>
+              <div className="citation-summary"><span>已选择 <b>{selected.length}</b> 条用于生成回答</span>{selected.length > 0 && <button onClick={() => setSelected([])}>取消全部选择</button>}</div>
               <div className="result-list" aria-live="polite">
                 {results.map((item, index) => (
                   <article className={`result-card ${selected.includes(item.id) ? "cited" : ""}`} key={item.id} style={{ animationDelay: `${index * 45}ms` }}>
@@ -669,15 +669,15 @@ export default function Home() {
 
         {view === "memory" && (
           <div className="page inner-page">
-            <PageTitle kicker="CONTEXT MEMORY" title="上下文记忆" description="只保存值得跨轮次检索的事实、决策和摘要；近期对话仍由模型上下文直接承载。"/>
+            <PageTitle kicker="长期记忆" title="记住重要信息" description="把以后还会用到的事实、决定和简短总结保存在这里。普通聊天内容不需要手动保存。"/>
             <div className="memory-layout">
-              <section className="paper-panel memory-compose"><PanelHeading number="壹" title="记住一件事" text="内容会与会话标识和重要度一起写入 ContextMemory。"/>
-                <label className="field"><span>会话标识</span><input value={sessionId} onChange={(e) => setSessionId(e.target.value)}/></label>
-                <label className="field"><span>记忆内容</span><textarea value={memoryText} onChange={(e) => setMemoryText(e.target.value)} placeholder="例如：数据库必须放在 WSL2 ext4，不使用 /mnt/d…"/></label>
-                <div className="memory-actions"><select aria-label="记忆类型"><option>decision · 决策</option><option>fact · 事实</option><option>summary · 摘要</option></select><button disabled={!memoryText.trim()} className="primary-button compact" onClick={() => { postGateway("/v1/memory", { content: memoryText, session_id: sessionId, memory_type: "decision", importance: .8, scope: "private" }, "已写入会话记忆"); setMemoryText(""); }}><Icon name="plus"/>保存记忆</button></div>
+              <section className="paper-panel memory-compose"><PanelHeading number="1" title="保存一条长期记忆" text="保存后，系统可以在以后的问答中重新找到它。"/>
+                <label className="field"><span>归属会话</span><input value={sessionId} onChange={(e) => setSessionId(e.target.value)}/><small>用于区分不同项目或对话，可保留默认值。</small></label>
+                <label className="field"><span>记忆内容</span><textarea value={memoryText} onChange={(e) => setMemoryText(e.target.value)} placeholder="例如：项目交付前必须先完成离线环境测试。"/></label>
+                <div className="memory-actions"><select aria-label="记忆类型"><option>这是一个决定</option><option>这是一个事实</option><option>这是一段总结</option></select><button disabled={!memoryText.trim()} className="primary-button compact" onClick={() => { postGateway("/v1/memory", { content: memoryText, session_id: sessionId, memory_type: "decision", importance: .8, scope: "private" }, "已保存到长期记忆"); setMemoryText(""); }}><Icon name="plus"/>保存</button></div>
               </section>
-              <section className="memory-list-panel"><div className="memory-list-head"><span className="section-kicker">RECENT MEMORY</span><h2>近期记忆</h2></div>
-                {[ ["决策", "BGE-M3 内置于 Gateway，只负责查询与文档向量。", "今天 18:44"], ["事实", "Gemma 4 31B Q4 通过 llama.cpp server 提供本地模型接口。", "今天 18:39"], ["摘要", "下一版由 Gateway 统一完成分类、检索编排与带依据回答。", "今天 18:33"] ].map(([type, text, time], i) => <article className="memory-card" key={text}><span>{type}</span><p>{text}</p><footer><i>重要度 {(.9 - i * .1).toFixed(1)}</i><time>{time}</time></footer></article>)}
+              <section className="memory-list-panel"><div className="memory-list-head"><span className="section-kicker">最近保存</span><h2>近期记忆</h2></div>
+                {[ ["决定", "资料搜索和文字理解由本机服务统一完成。", "今天 18:44"], ["事实", "本地回答模型已经连接，可以根据资料生成回答。", "今天 18:39"], ["总结", "下一版将继续完善自动分类和带出处的回答。", "今天 18:33"] ].map(([type, text, time], i) => <article className="memory-card" key={text}><span>{type}</span><p>{text}</p><footer><i>优先级：{i === 0 ? "高" : i === 1 ? "中" : "普通"}</i><time>{time}</time></footer></article>)}
               </section>
             </div>
           </div>
@@ -685,35 +685,38 @@ export default function Home() {
 
         {view === "status" && (
           <div className="page inner-page">
-            <div className="title-row"><PageTitle kicker="SYSTEM PULSE" title="服务状态" description={`上次检查：${lastCheck}。状态检测只读取健康端点，不修改服务。`}/><div className="status-actions"><button className="outline-button" onClick={checkHealth}><Icon name="pulse"/>重新检查</button><button className="outline-button" onClick={() => handleRestart("all")} disabled={restarting.has("all")}>{restarting.has("all") ? "全部重启中…" : "重启全部服务"}</button></div></div>
+            <div className="title-row"><PageTitle kicker="运行状态" title="系统是否正常运行" description={`上次检查：${lastCheck}。检查不会修改任何服务；只有点击重启按钮才会执行操作。`}/><div className="status-actions"><button className="outline-button" onClick={checkHealth}><Icon name="pulse"/>重新检查</button><button className="outline-button" onClick={() => handleRestart("all")} disabled={restarting.has("all")}>{restarting.has("all") ? "正在重启…" : "重启全部服务"}</button></div></div>
             <div className="status-grid">
-              {([ ["gateway", "RAG Gateway + BGE-M3", settings.gatewayUrl, "检索编排、入库、权限与进程内向量化", "9100"], ["weaviate", "Weaviate", settings.weaviateUrl, "BM25 + HNSW 混合索引", "8080"], ["llm", "Gemma 4 31B Q4", settings.llmUrl, "llama.cpp · 问答与问题分类器", "8000"] ] as [ServiceKey, string, string, string, string][]).map(([key, title, url, description, metric], i) => <article className="status-card" key={key}><div className="status-card-top"><span className="ordinal">{["壹", "贰", "叁"][i]}</span><span className={`large-status ${health[key]}`}>{health[key] === "checking" ? "检查中" : health[key] === "online" ? "运行正常" : "无法连接"}</span></div><h2>{title}</h2><p>{description}</p><code>{url}</code><footer><span>当前端口</span><b>{health[key] === "online" ? metric : "—"}</b></footer><div className="status-card-actions"><button className="outline-button compact-restart" onClick={() => handleRestart(key as "gateway" | "weaviate" | "llm")} disabled={restarting.has(key)}>{restarting.has(key) ? "重启中…" : "重启服务"}</button></div></article>)}
-              <article className="status-card"><div className="status-card-top"><span className="ordinal">肆</span><span className={`large-status ${llmApiHealth}`}>{llmApiHealth === "checking" ? "检查中" : llmApiHealth === "online" ? "连通正常" : "未配置或无法连接"}</span></div><h2>LLM 归类 API</h2><p>OpenAI 兼容接口 · 知识库 AI 自动归类推理</p><code>{settings.llmApiUrl || "(未配置)"}</code><footer><span>{llmApiInfo.model || "模型"}</span><b>{llmApiHealth === "online" && llmApiInfo.latency_ms ? `${llmApiInfo.latency_ms}ms` : "—"}</b></footer></article>
+              {([ ["gateway", "资料检索服务", settings.gatewayUrl, "负责查找资料、接收新文件并把各项服务连接起来。", "9100"], ["weaviate", "资料索引服务", settings.weaviateUrl, "保存可搜索的资料索引，让关键词和语义搜索都能工作。", "8080"], ["llm", "本地回答模型", settings.llmUrl, "根据找到的资料生成回答，也可协助整理知识库。", "8000"] ] as [ServiceKey, string, string, string, string][]).map(([key, title, url, description, metric], i) => <article className="status-card" key={key}><div className="status-card-top"><span className="ordinal">{i + 1}</span><span className={`large-status ${health[key]}`}>{health[key] === "checking" ? "检查中" : health[key] === "online" ? "运行正常" : "无法连接"}</span></div><h2>{title}</h2><p>{description}</p><details className="technical-details"><summary>查看连接地址</summary><code>{url}</code><footer><span>使用端口</span><b>{health[key] === "online" ? metric : "—"}</b></footer></details><div className="status-card-actions"><button className="outline-button compact-restart" onClick={() => handleRestart(key as "gateway" | "weaviate" | "llm")} disabled={restarting.has(key)}>{restarting.has(key) ? "重启中…" : "重启这项服务"}</button></div></article>)}
+              <article className="status-card"><div className="status-card-top"><span className="ordinal">4</span><span className={`large-status ${llmApiHealth}`}>{llmApiHealth === "checking" ? "检查中" : llmApiHealth === "online" ? "连接正常" : "尚未连接"}</span></div><h2>智能分类助手</h2><p>帮助把未整理资料放进合适的分类；所有建议都需要人工确认。</p><details className="technical-details"><summary>查看技术信息</summary><code>{settings.llmApiUrl || "尚未填写服务地址"}</code><footer><span>{llmApiInfo.model || "使用模型"}</span><b>{llmApiHealth === "online" && llmApiInfo.latency_ms ? `${llmApiInfo.latency_ms}ms` : "—"}</b></footer></details></article>
             </div>
-            <section className="paper-panel resource-panel"><PanelHeading number="监" title="资源边界" text="按部署文档设定的本机资源上限。"/><div className="resource-bars"><ResourceBar label="Weaviate 内存" value="8.7 / 14 GB" width="62%"/><ResourceBar label="Embedding 内存" value="3.2 / 6 GB" width="53%"/><ResourceBar label="向量容量" value="0.34 / 0.8 M" width="42%"/></div></section>
+            <section className="paper-panel resource-panel"><PanelHeading number="用量" title="资源使用情况" text="用于判断本机是否还有足够资源继续添加资料。"/><div className="resource-bars"><ResourceBar label="资料索引占用内存" value="8.7 / 14 GB" width="62%"/><ResourceBar label="文字理解服务占用内存" value="3.2 / 6 GB" width="53%"/><ResourceBar label="已使用的索引容量" value="34 万 / 80 万" width="42%"/></div></section>
           </div>
         )}
 
         {view === "settings" && (
           <div className="page inner-page">
-            <PageTitle kicker="CONNECTION" title="连接设置" description="设置只保存在当前浏览器；API Key 不会写入项目源码。"/>
+            <PageTitle kicker="系统设置" title="连接与显示设置" description="常用设置直接显示；不常使用的技术选项可以按需展开。密码只保存在当前浏览器，不会写入项目源码。"/>
             <section className="paper-panel settings-panel">
-              <div className="mode-switch"><div><b>运行模式</b><p>演示模式使用内置样例；本地服务模式调用 WSL2 中的真实端点。</p></div><button className={settings.demoMode ? "demo" : "live"} onClick={() => saveSettings({ ...settings, demoMode: !settings.demoMode })}><span/><b>{settings.demoMode ? "演示模式" : "本地服务"}</b></button></div>
-              <div className="settings-grid">
-                <label className="field"><span>RAG Gateway</span><input value={settings.gatewayUrl} onChange={(e) => setSettings({ ...settings, gatewayUrl: e.target.value })}/></label>
-                <label className="field"><span>Weaviate</span><input value={settings.weaviateUrl} onChange={(e) => setSettings({ ...settings, weaviateUrl: e.target.value })}/></label>
-                <label className="field"><span>llama.cpp Gemma API</span><input value={settings.llmUrl} onChange={(e) => setSettings({ ...settings, llmUrl: e.target.value })}/></label>
-                <label className="field"><span>Weaviate / Gateway API Key</span><input type="password" value={settings.apiKey} placeholder="至少 32 字节" onChange={(e) => setSettings({ ...settings, apiKey: e.target.value })}/></label>
-                <label className="field"><span>Gemma 模型别名</span><input value={settings.model} onChange={(e) => setSettings({ ...settings, model: e.target.value })}/></label>
-              </div>
-              <section className="space-settings">
-                <div className="space-settings-head"><div><span className="section-kicker">LLM API</span><h2>归类模型 API</h2></div><span>用于知识库 AI 自动归类</span></div>
-                <p>配置 OpenAI 兼容的 API 端点（如通义千问 DashScope、OpenAI 等）。URL 和 Key 仅保存在浏览器，不会写入项目源码。设置保存时自动同步到 Gateway。</p>
+              <div className="mode-switch"><div><b>使用哪套数据</b><p>体验模式使用内置样例；本地模式读取你电脑中已经部署好的真实资料。</p></div><button className={settings.demoMode ? "demo" : "live"} onClick={() => saveSettings({ ...settings, demoMode: !settings.demoMode })}><span/><b>{settings.demoMode ? "体验模式" : "本地模式"}</b></button></div>
+              <details className="settings-group" open>
+                <summary><span><b>本地服务连接</b><small>部署后通常只需设置一次</small></span></summary>
                 <div className="settings-grid">
-                  <label className="field"><span>API Base URL</span><input value={settings.llmApiUrl} placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1" onChange={(e) => setSettings({ ...settings, llmApiUrl: e.target.value })}/></label>
-                  <label className="field"><span>API Key</span><input type="password" value={settings.llmApiKey} placeholder="sk-..." onChange={(e) => setSettings({ ...settings, llmApiKey: e.target.value })}/></label>
-                  <label className="field"><span>Model 名称</span><input value={settings.llmModel} placeholder="qwen-plus" onChange={(e) => setSettings({ ...settings, llmModel: e.target.value })}/></label>
-                  <label className="field"><span>连通性测试</span><button className="outline-button" style={{ width: "100%", height: "46px" }} onClick={async () => {
+                  <label className="field"><span>资料检索服务地址</span><input value={settings.gatewayUrl} onChange={(e) => setSettings({ ...settings, gatewayUrl: e.target.value })}/><small>默认端口 9100</small></label>
+                  <label className="field"><span>资料索引服务地址</span><input value={settings.weaviateUrl} onChange={(e) => setSettings({ ...settings, weaviateUrl: e.target.value })}/><small>默认端口 8080</small></label>
+                  <label className="field"><span>本地回答模型地址</span><input value={settings.llmUrl} onChange={(e) => setSettings({ ...settings, llmUrl: e.target.value })}/><small>默认端口 8000</small></label>
+                  <label className="field"><span>本地服务访问密码</span><input type="password" value={settings.apiKey} placeholder="由部署脚本生成" onChange={(e) => setSettings({ ...settings, apiKey: e.target.value })}/></label>
+                  <label className="field"><span>本地模型名称</span><input value={settings.model} onChange={(e) => setSettings({ ...settings, model: e.target.value })}/></label>
+                </div>
+              </details>
+              <details className="settings-group">
+                <summary><span><b>智能分类助手</b><small>可选：连接外部模型帮助整理资料</small></span></summary>
+                <p>如果需要自动分类，可填写兼容 OpenAI 格式的模型服务。地址和密码只保存在浏览器中，保存设置时会同步给本地检索服务。</p>
+                <div className="settings-grid">
+                  <label className="field"><span>模型服务地址</span><input value={settings.llmApiUrl} placeholder="例如通义千问的兼容接口地址" onChange={(e) => setSettings({ ...settings, llmApiUrl: e.target.value })}/></label>
+                  <label className="field"><span>模型服务密码</span><input type="password" value={settings.llmApiKey} placeholder="通常以 sk- 开头" onChange={(e) => setSettings({ ...settings, llmApiKey: e.target.value })}/></label>
+                  <label className="field"><span>模型名称</span><input value={settings.llmModel} placeholder="例如 qwen-plus" onChange={(e) => setSettings({ ...settings, llmModel: e.target.value })}/></label>
+                  <label className="field"><span>测试是否可用</span><button className="outline-button" style={{ width: "100%", height: "46px" }} onClick={async () => {
                     try {
                       await fetch(`${settings.gatewayUrl.replace(/\/$/, "")}/v1/llm/config`, {
                         method: "POST",
@@ -728,26 +731,26 @@ export default function Home() {
                         flash(`❌ 连接失败：${result.error || "未知错误"}`);
                       }
                     } catch (e) { flash(`❌ 请求失败：${e instanceof Error ? e.message : "网络错误"}`); }
-                  }}>测试 LLM 连通性</button></label>
+                  }}>测试分类助手</button></label>
                 </div>
-              </section>
-              <section className="space-settings">
-                <div className="space-settings-head"><div><span className="section-kicker">DEEP SPACE DISPLAY</span><h2>深空显示参数</h2></div><span>实时预览</span></div>
+              </details>
+              <details className="settings-group">
+                <summary><span><b>深空背景与显示效果</b><small>可选：调整夜间模式的银河背景</small></span></summary>
                 <p>背景来自 ESO 帕拉纳尔 ALPACA 实拍科学帧，每小时检查一次；当地白天或质量不足时保留最近合格夜空并明确标识。</p>
                 <div className="sky-source-card">
                   <span className="sky-source-mark">ESO</span>
                   <div><b>ALPACA 全天空科学帧</b><small>{skyFrame.dpId} · SQM {skyFrame.sqmZen.toFixed(2)} mag/arcsec² · {skyFrame.sourceWidth} × {skyFrame.sourceHeight}</small></div>
                   <button className={settings.syntheticOverlay ? "enabled" : ""} onClick={() => setSettings({ ...settings, syntheticOverlay: !settings.syntheticOverlay })}><i/><span>{settings.syntheticOverlay ? "氛围增强已开" : "科研原图模式"}</span></button>
                 </div>
-                <p className="overlay-disclosure">“科研原图模式”不添加合成星。开启“氛围增强”后，以下星等与闪烁参数只控制 Canvas 视觉层，不改写科学帧，也不会被标记为观测数据。</p>
+                <p className="overlay-disclosure">“科研原图模式”不添加合成星。开启“氛围增强”后，下列选项只改变页面显示，不会修改实拍图片或观测信息。</p>
                 <div className={`space-control-grid ${settings.syntheticOverlay ? "" : "controls-muted"}`}>
                   <SpaceControl label="星场密度" value={settings.stellarDensity} min={0.45} max={2} step={0.05} unit="×" onChange={(value) => setSettings({ ...settings, stellarDensity: value })}/>
-                  <SpaceControl label="极限视星等" value={settings.limitingMagnitude} min={5} max={9} step={0.1} unit="m" onChange={(value) => setSettings({ ...settings, limitingMagnitude: value })}/>
+                  <SpaceControl label="可见暗星数量" value={settings.limitingMagnitude} min={5} max={9} step={0.1} unit="级" onChange={(value) => setSettings({ ...settings, limitingMagnitude: value })}/>
                   <SpaceControl label="闪烁幅度" value={settings.twinkleStrength} min={0} max={100} step={1} unit="%" onChange={(value) => setSettings({ ...settings, twinkleStrength: value })}/>
-                  <SpaceControl label="玻璃不透明度" value={settings.glassOpacity} min={12} max={48} step={1} unit="%" onChange={(value) => setSettings({ ...settings, glassOpacity: value })}/>
-                  <SpaceControl label="银河曝光" value={settings.galaxyExposure} min={45} max={120} step={1} unit="%" onChange={(value) => setSettings({ ...settings, galaxyExposure: value })}/>
+                  <SpaceControl label="面板透明程度" value={settings.glassOpacity} min={12} max={48} step={1} unit="%" onChange={(value) => setSettings({ ...settings, glassOpacity: value })}/>
+                  <SpaceControl label="银河背景亮度" value={settings.galaxyExposure} min={45} max={120} step={1} unit="%" onChange={(value) => setSettings({ ...settings, galaxyExposure: value })}/>
                 </div>
-              </section>
+              </details>
               <div className="settings-actions"><button className="outline-button" onClick={checkHealth}><Icon name="pulse"/>测试连接</button><button className="primary-button compact" onClick={() => {
                     saveSettings(settings);
                     // Sync LLM config to backend
@@ -756,9 +759,9 @@ export default function Home() {
                       headers: { "Content-Type": "application/json" },
                       body: JSON.stringify({ llm_api_base: settings.llmApiUrl, llm_api_key: settings.llmApiKey, llm_model: settings.llmModel }),
                     }).catch(() => {});
-                    flash("设置已保存并同步到 Gateway");
+                    flash("设置已保存");
                   }}><Icon name="check"/>保存设置</button></div>
-              <p className="security-note">建议仅绑定 127.0.0.1，并由 Gateway 统一处理 CORS、鉴权和 scope 过滤。远程打开此界面时，浏览器可能阻止访问本机 HTTP 服务。</p>
+              <details className="security-note"><summary>安全提示</summary><p>建议只允许本机访问这些服务。如果从另一台电脑打开本页面，浏览器可能无法连接这台电脑上的本地服务。</p></details>
             </section>
           </div>
         )}
