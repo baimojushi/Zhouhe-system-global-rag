@@ -2,6 +2,10 @@
 
 连接 Weaviate、进程内 BGE-M3、RAG Gateway 与 llama.cpp Gemma 的本地 GUI。
 
+Windows 原始资料目录固定为 `E:\RAG`，按四个文档知识库建立一级文件夹；关联知识库不创建原文目录。详见 [WINDOWS_RAG_LAYOUT_20260720.md](WINDOWS_RAG_LAYOUT_20260720.md)。
+
+2026-07-20：知识检索页新增显式开启的 LLM 多问法扩展、加权排名融合与自动降级；详见 [QUERY_REWRITE_IMPLEMENTATION_20260720.md](QUERY_REWRITE_IMPLEMENTATION_20260720.md)。
+
 完整安装、Docker、API 和 CORS 说明见 [README_LOCAL_DEPLOY.md](README_LOCAL_DEPLOY.md)。
 固定依赖版本见 [DEPENDENCY_MANIFEST.md](DEPENDENCY_MANIFEST.md)。
 本次 master/runtime 合并内容与验证结果见 [MERGE_REPORT_20260717.md](MERGE_REPORT_20260717.md)。

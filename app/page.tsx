@@ -35,6 +35,16 @@ type SearchResult = {
   tags: string[];
 };
 
+type RewriteInfo = {
+  enabled: boolean;
+  applied: boolean;
+  schema_version?: string;
+  strategy?: string;
+  queries: string[];
+  model?: string | null;
+  fallback_reason?: string | null;
+};
+
 type Settings = {
   demoMode: boolean;
   theme: "light" | "night";
@@ -68,9 +78,9 @@ const defaultSettings: Settings = {
   llmUrl: "http://127.0.0.1:8000",
   apiKey: "",
   model: "gemma-4-31b-q4",
-  llmApiUrl: "",
+  llmApiUrl: "http://127.0.0.1:8000/v1",
   llmApiKey: "",
-  llmModel: "qwen-plus",
+  llmModel: "gemma-4-31b-q4",
 };
 
 const settingsStorageKey = "global-rag-settings";
@@ -284,6 +294,9 @@ function DeepSpaceBackdrop({ active, overlay, imageUrl, density, limitingMagnitu
 
 function toResult(item: Record<string, unknown>, index: number): SearchResult {
   const props = (item.properties ?? item) as Record<string, unknown>;
+  const matchedQueries = Array.isArray(props.matched_queries ?? item.matched_queries)
+    ? (props.matched_queries ?? item.matched_queries) as unknown[]
+    : [];
   return {
     id: String(item.id ?? props.chunk_id ?? index),
     title: String(props.title ?? props.source_name ?? "未命名来源"),
@@ -294,7 +307,10 @@ function toResult(item: Record<string, unknown>, index: number): SearchResult {
     score: Number(item.score ?? props.score ?? item.certainty ?? 0),
     page: props.page == null ? undefined : Number(props.page),
     scope: String(props.scope ?? "global"),
-    tags: Array.isArray(props.tags) ? props.tags.map(String) : [String(props.mime_type ?? "知识片段")],
+    tags: [
+      ...(Array.isArray(props.tags) ? props.tags.map(String) : [String(props.mime_type ?? "知识片段")]),
+      ...(matchedQueries.length > 1 ? ["多问法命中"] : []),
+    ],
   };
 }
 
@@ -307,6 +323,8 @@ export default function Home() {
   const [scope, setScope] = useState("all");
   const [alpha, setAlpha] = useState(65);
   const [topK, setTopK] = useState(6);
+  const [rewriteEnabled, setRewriteEnabled] = useState(false);
+  const [rewriteInfo, setRewriteInfo] = useState<RewriteInfo | null>(null);
   const [results, setResults] = useState<SearchResult[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
   const [hasSearched, setHasSearched] = useState(false);
@@ -387,6 +405,7 @@ export default function Home() {
     setResults([]);
     setSelected([]);
     setAnswer("");
+    setRewriteInfo(null);
     try {
       if (settings.demoMode) {
         await new Promise((resolve) => window.setTimeout(resolve, 620));
@@ -395,16 +414,25 @@ export default function Home() {
           .map((item) => ({ ...item, score: Math.min(.98, item.score + (terms.some((term) => `${item.title}${item.content}`.toLowerCase().includes(term)) ? .02 : 0)) }))
           .slice(0, topK);
         setResults(ranked);
+        if (rewriteEnabled) setRewriteInfo({ enabled: true, applied: false, queries: [query.trim()], fallback_reason: "体验模式不会调用模型；切换到本地模式后即可使用问题扩展。" });
       } else {
+        if (rewriteEnabled) {
+          await fetch(`${settings.gatewayUrl.replace(/\/$/, "")}/v1/llm/config`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...(settings.apiKey ? { Authorization: `Bearer ${settings.apiKey}` } : {}) },
+            body: JSON.stringify({ llm_api_base: settings.llmApiUrl || `${settings.llmUrl.replace(/\/$/, "")}/v1`, llm_api_key: settings.llmApiKey, llm_model: settings.llmModel || settings.model }),
+          });
+        }
         const response = await fetch(`${settings.gatewayUrl.replace(/\/$/, "")}/v1/retrieve`, {
           method: "POST",
           headers: { "Content-Type": "application/json", ...(settings.apiKey ? { Authorization: `Bearer ${settings.apiKey}` } : {}) },
-          body: JSON.stringify({ query, scope: scope === "all" ? undefined : scope, alpha: alpha / 100, top_k: topK, session_id: sessionId }),
+          body: JSON.stringify({ query, scope: scope === "all" ? undefined : scope, alpha: alpha / 100, top_k: topK, session_id: sessionId, rewrite_enabled: rewriteEnabled, rewrite_strategy: "multi_query", rewrite_max_variants: 2 }),
         });
         if (!response.ok) throw new Error(`检索失败：HTTP ${response.status}`);
         const payload = await response.json() as Record<string, unknown>;
         const items = (payload.results ?? payload.items ?? payload.data ?? []) as Record<string, unknown>[];
         setResults(items.map(toResult));
+        if (payload.rewrite && typeof payload.rewrite === "object") setRewriteInfo(payload.rewrite as RewriteInfo);
       }
     } catch (error) {
       flash(error instanceof Error ? error.message : "无法连接检索服务");
@@ -434,7 +462,7 @@ export default function Home() {
     }));
     setHealth(Object.fromEntries(states) as Record<ServiceKey, HealthState>);
     // Check LLM API connectivity
-    if (settings.llmApiUrl && settings.llmApiKey) {
+    if (settings.llmApiUrl) {
       try {
         await fetch(`${settings.gatewayUrl.replace(/\/$/, "")}/v1/llm/config`, {
           method: "POST",
@@ -634,6 +662,11 @@ export default function Home() {
                   </div>
                 </div>
 
+                <div className={`rewrite-control ${rewriteEnabled ? "enabled" : ""}`}>
+                  <div><b>让智能助手扩展问法</b><p>用原问题加两个互补问法一起检索，适合描述模糊或跨术语的问题。会多用少量模型算力。</p></div>
+                  <button type="button" role="switch" aria-checked={rewriteEnabled} aria-label="让智能助手扩展问法" onClick={() => setRewriteEnabled((enabled) => !enabled)}><span/><b>{rewriteEnabled ? "已开启" : "未开启"}</b></button>
+                </div>
+
                 <div className="weight-block">
                   <div className="weight-head"><label htmlFor="alpha">更看重哪种匹配方式</label><span><b>理解意思 {alpha}%</b><i>匹配原词 {100 - alpha}%</i></span></div>
                   <input id="alpha" type="range" min="0" max="100" value={alpha} onChange={(e) => setAlpha(Number(e.target.value))} style={{ "--range": `${alpha}%` } as React.CSSProperties}/>
@@ -651,6 +684,7 @@ export default function Home() {
 
             <section className="results-column">
               <div className="results-head"><div><span className="section-kicker">找到的资料</span><h2>可用资料</h2></div><div className="result-count"><b>{results.length}</b><span>条结果</span></div></div>
+              {rewriteInfo?.enabled && <div className={`rewrite-result-note ${rewriteInfo.applied ? "applied" : "fallback"}`}><div><b>{rewriteInfo.applied ? "已扩展问法并合并结果" : "已使用原问题检索"}</b><span>{rewriteInfo.fallback_reason || (rewriteInfo.model ? `由 ${rewriteInfo.model} 生成，原问题权重更高。` : "原问题始终保留。")}</span></div>{rewriteInfo.queries?.length > 1 && <details><summary>查看实际检索问法</summary><ol>{rewriteInfo.queries.map((item) => <li key={item}>{item}</li>)}</ol></details>}</div>}
               {hasSearched && results.length > 0 && <div className="citation-summary"><span>已选择 <b>{selected.length}</b> 条用于生成回答</span>{selected.length > 0 && <button onClick={() => setSelected([])}>取消全部选择</button>}</div>}
               <div className="result-list" aria-live="polite">
                 {loading && <div className="empty-state search-loading-state"><span className="loading-mark"/><h3>正在查找资料</h3><p>系统正在比较问题与知识库内容。</p></div>}
@@ -715,12 +749,12 @@ export default function Home() {
                 </div>
               </details>
               <details className="settings-group">
-                <summary><span><b>智能分类助手</b><small>可选：连接外部模型帮助整理资料</small></span></summary>
-                <p>如果需要自动分类，可填写兼容 OpenAI 格式的模型服务。地址和密码只保存在浏览器中，保存设置时会同步给本地检索服务。</p>
+                <summary><span><b>智能整理与问题改写</b><small>可选：连接本地或外部模型</small></span></summary>
+                <p>自动分类和“扩展问法”共用兼容 OpenAI 格式的模型服务。本地 llama.cpp 通常不需要密码；设置会保存在当前浏览器并同步给本地检索服务。</p>
                 <div className="settings-grid">
-                  <label className="field"><span>模型服务地址</span><input value={settings.llmApiUrl} placeholder="例如通义千问的兼容接口地址" onChange={(e) => setSettings({ ...settings, llmApiUrl: e.target.value })}/></label>
-                  <label className="field"><span>模型服务密码</span><input type="password" value={settings.llmApiKey} placeholder="通常以 sk- 开头" onChange={(e) => setSettings({ ...settings, llmApiKey: e.target.value })}/></label>
-                  <label className="field"><span>模型名称</span><input value={settings.llmModel} placeholder="例如 qwen-plus" onChange={(e) => setSettings({ ...settings, llmModel: e.target.value })}/></label>
+                  <label className="field"><span>模型服务地址</span><input value={settings.llmApiUrl} placeholder="例如 http://127.0.0.1:8000/v1" onChange={(e) => setSettings({ ...settings, llmApiUrl: e.target.value })}/></label>
+                  <label className="field"><span>模型服务密码（可不填）</span><input type="password" value={settings.llmApiKey} placeholder="本地模型通常留空" onChange={(e) => setSettings({ ...settings, llmApiKey: e.target.value })}/></label>
+                  <label className="field"><span>模型名称</span><input value={settings.llmModel} placeholder="例如 gemma-4-31b-q4" onChange={(e) => setSettings({ ...settings, llmModel: e.target.value })}/></label>
                   <label className="field"><span>测试是否可用</span><button className="outline-button" style={{ width: "100%", height: "46px" }} onClick={async () => {
                     try {
                       await fetch(`${settings.gatewayUrl.replace(/\/$/, "")}/v1/llm/config`, {
@@ -736,7 +770,7 @@ export default function Home() {
                         flash(`❌ 连接失败：${result.error || "未知错误"}`);
                       }
                     } catch (e) { flash(`❌ 请求失败：${e instanceof Error ? e.message : "网络错误"}`); }
-                  }}>测试分类助手</button></label>
+                  }}>测试智能助手</button></label>
                 </div>
               </details>
               <details className="settings-group">

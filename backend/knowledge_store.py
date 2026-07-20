@@ -1236,6 +1236,24 @@ class KnowledgeStore:
         finally:
             conn.close()
 
+    def find_document_by_source_path(
+        self, library_id: str, source_path: str
+    ) -> Optional[dict[str, Any]]:
+        """Find the newest live document registered for an exact source path."""
+        conn = self._connect()
+        try:
+            self._require_library(conn, library_id)
+            row = conn.execute(
+                """SELECT id FROM documents
+                   WHERE library_id = ? AND source_path = ? AND status != 'trash'
+                   ORDER BY updated_at DESC LIMIT 1""",
+                (library_id, source_path),
+            ).fetchone()
+            document_id = row["id"] if row else None
+        finally:
+            conn.close()
+        return self.get_document(document_id) if document_id else None
+
     def create_document(
         self,
         library_id: str,

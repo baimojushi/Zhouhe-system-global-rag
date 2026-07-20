@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LLM Adapter — OpenAI / 通义千问 compatible classification endpoint.
+LLM Adapter — OpenAI-compatible classification and query-rewrite endpoint.
 
 Configuration (environment variables):
   LLM_API_BASE     — e.g. https://api.openai.com/v1  or  https://dashscope.aliyuncs.com/compatible-mode/v1
@@ -16,6 +16,11 @@ import os
 import json
 import asyncio
 from typing import Any
+
+try:
+    from query_rewriter import extract_json_object, sanitize_rewrite_candidates
+except ImportError:
+    from backend.query_rewriter import extract_json_object, sanitize_rewrite_candidates
 
 _default_base = os.environ.get("LLM_API_BASE", "")
 _default_key = os.environ.get("LLM_API_KEY", "")
@@ -60,8 +65,15 @@ def get_config() -> dict:
         "llm_api_base": base or "(未配置)",
         "llm_api_key": masked_key or "(未配置)",
         "llm_model": model,
-        "configured": bool(base and key),
+        "configured": bool(base),
     }
+
+
+def _headers() -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if _key():
+        headers["Authorization"] = f"Bearer {_key()}"
+    return headers
 
 # ---------------------------------------------------------------------------
 # Prompt template
@@ -105,6 +117,19 @@ _CLASSIFY_PROMPT = """\
 只返回 JSON。
 """
 
+_QUERY_REWRITE_PROMPT = """\
+你是知识检索中的“问题扩展器”，不是回答助手。请把用户问题改写成最多 {max_variants} 个互补的检索问法，以扩大召回范围。
+
+规则：
+1. 保留原意，不回答问题，不捏造事实。
+2. 文件名、路径、命令、错误码、产品名、型号、版本号和专有名词必须原样保留。
+3. 一个问法补充可能的中文同义表述；另一个可补充常见英文技术词或更明确的故障现象。
+4. 每个问法应能单独用于搜索；不要重复原问题。
+5. 只返回 JSON：{{"queries":["问法一","问法二"]}}。
+
+用户问题：{query}
+"""
+
 
 async def call_llm_for_classification(
     library_id: str,
@@ -118,16 +143,13 @@ async def call_llm_for_classification(
     """
     import aiohttp
 
-    if not _base() or not _key():
-        raise ValueError("LLM 未配置：请在前端设置页面配置 LLM API URL 和 Key")
+    if not _base():
+        raise ValueError("LLM 未配置：请在前端设置页面配置模型服务地址")
 
     prompt = _CLASSIFY_PROMPT.format(subtree=subtree, routing_cards=json.dumps(routing_cards, ensure_ascii=False, indent=2))
 
     async with aiohttp.ClientSession() as session:
-        headers = {
-            "Authorization": f"Bearer {_key()}",
-            "Content-Type": "application/json",
-        }
+        headers = _headers()
         payload = {
             "model": _model(),
             "messages": [
@@ -174,6 +196,51 @@ async def call_llm_for_classification(
     }
 
 
+async def call_llm_for_query_rewrite(
+    query: str,
+    max_variants: int = 2,
+    timeout_seconds: int = 30,
+) -> dict[str, Any]:
+    """Generate bounded alternatives through any OpenAI-compatible endpoint."""
+    import aiohttp
+
+    if not _base():
+        raise ValueError("模型服务地址未配置")
+    max_variants = max(1, min(int(max_variants), 4))
+    prompt = _QUERY_REWRITE_PROMPT.format(query=query, max_variants=max_variants)
+    payload = {
+        "model": _model(),
+        "messages": [
+            {"role": "system", "content": "你只扩展检索问法，并严格返回 JSON。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 320,
+        "response_format": {"type": "json_object"},
+    }
+    url = f"{_base().rstrip('/')}/chat/completions"
+    timeout = aiohttp.ClientTimeout(total=max(3, min(int(timeout_seconds), 120)))
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload, headers=_headers(), timeout=timeout) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"模型服务返回 HTTP {resp.status}: {text[:200]}")
+            data = await resp.json()
+    choices = data.get("choices", [])
+    if not choices:
+        raise RuntimeError("模型没有返回改写结果")
+    content = choices[0].get("message", {}).get("content", "")
+    parsed = extract_json_object(content)
+    variants = sanitize_rewrite_candidates(query, parsed.get("queries", []), max_variants)
+    usage = data.get("usage", {})
+    return {
+        "queries": variants,
+        "model": data.get("model") or _model(),
+        "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
+        "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+    }
+
+
 async def test_connectivity() -> dict:
     """Send a minimal request to the LLM API to verify connectivity.
 
@@ -186,14 +253,14 @@ async def test_connectivity() -> dict:
     key = _key()
     model = _model()
 
-    if not base or not key:
-        return {"ok": False, "error": "LLM API URL 和 Key 未配置", "model": model}
+    if not base:
+        return {"ok": False, "error": "模型服务地址未配置", "model": model}
 
     models_url = f"{base.rstrip('/')}/models"
     start = time.time()
     try:
         async with aiohttp.ClientSession() as session:
-            headers = {"Authorization": f"Bearer {key}"}
+            headers = _headers()
             async with session.get(models_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 latency_ms = int((time.time() - start) * 1000)
                 if resp.status == 200:

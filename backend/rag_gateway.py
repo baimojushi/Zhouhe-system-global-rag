@@ -22,6 +22,7 @@ Security:
   - Model-visible tools are READ-ONLY (no ingest/delete)
 """
 import os
+import asyncio
 import sys
 import logging
 import argparse
@@ -46,6 +47,11 @@ import weaviate.classes as wvc
 from weaviate.auth import AuthApiKey
 from FlagEmbedding import FlagModel
 
+try:
+    from query_rewriter import retrieve_with_optional_rewrite
+except ImportError:
+    from backend.query_rewriter import retrieve_with_optional_rewrite
+
 # Keep absolute imports: the deployed Gateway is launched directly as a script.
 from knowledge_store import (
     DEFAULT_LIBRARIES,
@@ -55,6 +61,11 @@ from knowledge_store import (
     StoreNotFound,
     StoreValidationError,
 )
+from ingest_layout import (
+    ensure_layout,
+    layout_status,
+)
+from ingest_service import queue_ingest_file, scan_ingest_folders
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -114,12 +125,15 @@ def get_model() -> FlagModel:
 # ---------------------------------------------------------------------------
 
 class RetrieveRequest(BaseModel):
-    query: str
+    query: str = Field(min_length=1, max_length=500)
     top_k: int = Field(default=5, ge=1, le=20)
     alpha: float = Field(default=0.55, ge=0.0, le=1.0)
     scope: str = Field(default="global")
     library_id: Optional[str] = Field(default=None, description="Filter by library ID")
     active_versions_only: bool = Field(default=True, description="Only return chunks from active document versions")
+    rewrite_enabled: bool = Field(default=False, description="Explicitly enable LLM query expansion")
+    rewrite_strategy: str = Field(default="multi_query", pattern="^[a-z0-9_-]{1,40}$")
+    rewrite_max_variants: int = Field(default=2, ge=1, le=4)
     return_fields: list[str] = ["content", "title", "heading", "source_path", "source_name", "page"]
 
 class IngestTextRequest(BaseModel):
@@ -283,6 +297,7 @@ def hybrid_search(query: str, top_k: int = 5, alpha: float = 0.55,
             "mime_type": obj.properties.get("mime_type", ""),
             "version_id": version_id,
             "document_id": obj.properties.get("document_id", ""),
+            "score": float(getattr(obj.metadata, "score", 0.0) or 0.0),
         }
         results.append(item)
         if len(results) >= top_k:
@@ -369,15 +384,30 @@ async def health():
 
 @app.post("/v1/retrieve")
 async def retrieve(request: RetrieveRequest):
-    """Core retrieval endpoint — hybrid search with version-aware filtering."""
+    """Hybrid retrieval with optional, failure-isolated query expansion."""
     try:
-        results = hybrid_search(
-            query=request.query,
-            top_k=request.top_k,
-            alpha=request.alpha,
-            filters={"scope": request.scope},
-            library_id=request.library_id,
-            active_versions_only=request.active_versions_only,
+        if request.rewrite_enabled and request.rewrite_strategy != "multi_query":
+            raise HTTPException(status_code=422, detail=f"不支持的问题改写策略：{request.rewrite_strategy}")
+        configured_max = max(1, min(int(os.environ.get("RAG_QUERY_REWRITE_MAX_VARIANTS", "2")), 4))
+        max_variants = min(request.rewrite_max_variants, configured_max)
+        timeout_seconds = max(3, min(int(os.environ.get("RAG_QUERY_REWRITE_TIMEOUT_SECONDS", "30")), 120))
+        rank_constant = max(1, min(int(os.environ.get("RAG_QUERY_REWRITE_RRF_K", "60")), 1000))
+
+        async def rewrite_call(query: str, limit: int):
+            from llm_adapter import call_llm_for_query_rewrite
+            return await call_llm_for_query_rewrite(query, limit, timeout_seconds)
+
+        def search_call(query: str, limit: int):
+            return hybrid_search(query=query, top_k=limit, alpha=request.alpha,
+                filters={"scope": request.scope}, library_id=request.library_id,
+                active_versions_only=request.active_versions_only)
+
+        results, rewrite = await retrieve_with_optional_rewrite(
+            original_query=request.query, top_k=request.top_k,
+            rewrite_enabled=request.rewrite_enabled, max_variants=max_variants,
+            rewrite_call=rewrite_call, search_call=search_call,
+            rank_constant=rank_constant, strategy=request.rewrite_strategy,
+            provider="openai_compatible", warning=log.warning,
         )
         return {
             "query": request.query,
@@ -386,12 +416,26 @@ async def retrieve(request: RetrieveRequest):
             "scope": request.scope,
             "library_id": request.library_id,
             "active_versions_only": request.active_versions_only,
+            "rewrite": rewrite,
             "results": results,
             "count": len(results),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         log.error(f"Retrieve error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/v1/rewrite/capabilities")
+async def rewrite_capabilities():
+    """Stable discovery contract for future rewrite and retrieval tools."""
+    return {
+        "schema_version": "1.0",
+        "default_strategy": "multi_query",
+        "strategies": [{"id": "multi_query", "name": "多问法扩展",
+            "provider": "openai_compatible", "max_variants": 4,
+            "fusion": "weighted_rrf"}],
+    }
 
 @app.post("/v1/ingest/text")
 async def ingest_text(request: IngestTextRequest):
@@ -886,6 +930,9 @@ class V2IngestPathRequest(BaseModel):
     path: str = Field(min_length=1)
     library_id: str
     target_node_id: str
+class V2IngestScanRequest(BaseModel):
+    library_id: Optional[str] = None
+    max_files: int = Field(default=1000, ge=1, le=5000)
 class ProposalItemRetargetRequest(BaseModel): target_node_id:str
 class V2EdgeCreateRequest(BaseModel):
     association_library_id:str;source_document_id:str;target_document_id:str;relation_type:str="related";confidence:float=Field(default=0,ge=0,le=1);note:str="";evidence:list=Field(default_factory=list)
@@ -897,6 +944,10 @@ CONTROL_DB_PATH = os.environ.get(
     "RAG_CONTROL_DB", "/opt/global-rag/data/knowledge-control.db"
 )
 knowledge_store = KnowledgeStore(CONTROL_DB_PATH)
+try:
+    ensure_layout()
+except OSError as exc:
+    log.warning("Windows ingest layout is not available yet: %s", exc)
 
 
 def _model_fields(model: BaseModel, *excluded: str) -> dict:
@@ -911,7 +962,7 @@ def _model_fields(model: BaseModel, *excluded: str) -> dict:
 
 
 def _allowed_ingest_roots() -> list[Path]:
-    configured = os.environ.get("RAG_INGEST_ROOTS", "/opt/global-rag/kb")
+    configured = os.environ.get("RAG_INGEST_ROOTS", "/mnt/e/RAG")
     roots = []
     for raw in configured.split(os.pathsep):
         raw = raw.strip()
@@ -938,6 +989,17 @@ def _hash_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _queue_ingest_file(
+    path: Path,
+    library_id: str,
+    target_node_id: str,
+    actor: str,
+) -> tuple[dict, str]:
+    return queue_ingest_file(
+        knowledge_store, path, library_id, target_node_id, actor
+    )
 
 
 # --- Routes ---
@@ -1151,34 +1213,60 @@ async def v2_ingest_path(
     actor: str = Depends(require_management_auth),
 ):
     path = _resolve_allowed_ingest_path(request.path)
-    stat = path.stat()
-    identity = f"{path}:{stat.st_size}:{stat.st_mtime_ns}"
-    idempotency_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-    document_id = None
-    if path.is_file():
-        content_hash = _hash_file(path)
-        document = knowledge_store.create_document(
-            library_id=request.library_id,
-            title=path.name,
-            node_id=request.target_node_id,
-            mime_type=mimetypes.guess_type(path.name)[0] or "application/octet-stream",
-            source_path=str(path),
-            source_name=path.name,
-            content_hash=content_hash,
-            size_bytes=stat.st_size,
-            index_status="queued",
-            actor=actor,
-            idempotent=True,
-        )
-        document_id = document["id"]
-    job = knowledge_store.queue_ingest(
-        request.library_id,
-        request.target_node_id,
-        str(path),
-        idempotency_key,
-        document_id=document_id,
+    job, document_state = _queue_ingest_file(
+        path, request.library_id, request.target_node_id, actor
     )
-    return {"status": "queued", "job": job, "document_id": document_id}
+    return {
+        "status": "queued",
+        "job": job,
+        "document_id": job["document_id"],
+        "document_state": document_state,
+    }
+
+
+@app.get("/v2/ingest/layout")
+async def v2_ingest_layout():
+    return {
+        **layout_status(),
+        "auto_scan_seconds": int(os.environ.get("RAG_AUTO_SCAN_SECONDS", "300")),
+        "stability_seconds": int(os.environ.get("RAG_FILE_STABILITY_SECONDS", "30")),
+    }
+
+
+@app.post("/v2/ingest/layout:ensure")
+async def v2_ensure_ingest_layout(
+    _actor: str = Depends(require_management_auth),
+):
+    try:
+        return ensure_layout()
+    except OSError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"无法创建 E:\\RAG；请确认 E 盘已挂载并可写：{exc}",
+        )
+
+
+@app.post("/v2/ingest/scan", status_code=202)
+async def v2_scan_ingest_folders(
+    request: V2IngestScanRequest,
+    actor: str = Depends(require_management_auth),
+):
+    try:
+        return await asyncio.to_thread(
+            scan_ingest_folders,
+            knowledge_store,
+            request.library_id,
+            request.max_files,
+            actor,
+            float(os.environ.get("RAG_FILE_STABILITY_SECONDS", "30")),
+        )
+    except ValueError as exc:
+        raise StoreValidationError(str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"无法访问 E:\\RAG；请确认 E 盘已挂载：{exc}",
+        ) from exc
 
 
 @app.get("/v2/jobs")

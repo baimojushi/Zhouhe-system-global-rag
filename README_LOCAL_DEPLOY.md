@@ -2,6 +2,10 @@
 
 这是 GUI 的完整本地部署包。默认开启演示模式，无需后端即可检查所有页面和交互；切换到“本地服务”后，界面会调用 WSL2 中的 RAG Gateway、Weaviate 和 llama.cpp Gemma。BGE-M3 已内置于 Gateway，不再作为 Ollama/独立端点配置。
 
+原始资料统一保存在 Windows `E:\RAG`，WSL2 对应路径为 `/mnt/e/RAG`。一键启动会建立“AI工作记录、学术资料、生产文档、个人思维笔记”四个文件夹，并启动摄取 Worker；关联知识库不创建原始文件目录。
+
+摄取 Worker 默认每 300 秒扫描一次，并用 30 秒窗口确认文件已经复制稳定。可通过 `RAG_AUTO_SCAN_SECONDS` 和 `RAG_FILE_STABILITY_SECONDS` 调整；将前者设为 `0` 可关闭自动扫描，但前端“立即扫描”仍可使用。
+
 ## 一、直接使用 Node.js（推荐开发和调试）
 
 要求：Node.js 22.13 或更高版本。
@@ -141,7 +145,7 @@ scripts\stop-all-services.cmd
   "title": "文档标题",
   "heading": "章节标题",
   "content": "检索片段",
-  "source_path": "/opt/global-rag/kb/example.md",
+  "source_path": "/mnt/e/RAG/生产文档/example.md",
   "source_name": "example.md",
   "page": 12,
   "scope": "global",

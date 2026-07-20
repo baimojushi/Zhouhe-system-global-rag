@@ -117,6 +117,20 @@ type ProposalCreateResult = {
   validation_errors?: Array<{ document_id: string; target_node_id: string; message: string }>;
 };
 
+type ScanResult = {
+  submitted_count: number;
+  error_count: number;
+  windows_root: string;
+  truncated: boolean;
+};
+
+const librarySourceFolders: Record<string, { windows: string; wsl: string }> = {
+  "ai-work": { windows: "E:\\RAG\\AI工作记录", wsl: "/mnt/e/RAG/AI工作记录" },
+  academic: { windows: "E:\\RAG\\学术资料", wsl: "/mnt/e/RAG/学术资料" },
+  production: { windows: "E:\\RAG\\生产文档", wsl: "/mnt/e/RAG/生产文档" },
+  notes: { windows: "E:\\RAG\\个人思维笔记", wsl: "/mnt/e/RAG/个人思维笔记" },
+};
+
 type DialogState =
   | { type: "library" }
   | { type:"library-settings" }
@@ -399,7 +413,8 @@ export function KnowledgeWorkbench({
   const [bulkTarget, setBulkTarget] = useState("");
   const [aliasTarget, setAliasTarget] = useState("");
   const [tagDraft, setTagDraft] = useState("");
-  const [ingestPath, setIngestPath] = useState("/opt/global-rag/kb/inbox");
+  const [ingestPath, setIngestPath] = useState("/mnt/e/RAG/AI工作记录");
+  const [scanLoading, setScanLoading] = useState(false);
   const [proposals, setProposals] = useState<ProposalSummary[]>([]);
   const [proposal, setProposal] = useState<ProposalDetail | null>(null);
   const [proposalPanelOpen, setProposalPanelOpen] = useState(false);
@@ -562,6 +577,7 @@ export function KnowledgeWorkbench({
   }, [activeId, loadDocuments, search, selectedNodeId]);
 
   const activeLibrary = useMemo(() => libraries.find((library) => library.id === activeId) ?? libraries[0] ?? demoLibraries[0], [activeId, libraries]);
+  const activeSourceFolder = librarySourceFolders[activeId];
   const selectedNode = useMemo(() => findNode(tree, selectedNodeId), [selectedNodeId, tree]);
   const allNodes = useMemo(() => flattenTree(tree), [tree]);
   const overview = useMemo(() => ({
@@ -573,6 +589,9 @@ export function KnowledgeWorkbench({
 
   function chooseLibrary(libraryId: string) {
     setActiveId(libraryId);
+    if (librarySourceFolders[libraryId]) {
+      setIngestPath(librarySourceFolders[libraryId].wsl);
+    }
     setFocusedDocument(null);
     setSelectedDocuments(new Set());
     setSearch("");
@@ -811,6 +830,32 @@ export function KnowledgeWorkbench({
       onNotice(`导入任务 ${result.job.id.slice(0, 16)} 已加入后台处理`);
     } catch (error) {
       onNotice(error instanceof Error ? error.message : "开始导入失败");
+    }
+  }
+
+  async function scanLibraryFolder() {
+    if (!activeSourceFolder || activeLibrary.kind === "association") {
+      onNotice("关联知识库不保存原始文件");
+      return;
+    }
+    if (demoMode) {
+      onNotice(`演示模式未扫描；本地模式会读取 ${activeSourceFolder.windows}`);
+      return;
+    }
+    setScanLoading(true);
+    try {
+      const result = await callGateway<ScanResult>("/v2/ingest/scan", {
+        method: "POST",
+        body: JSON.stringify({ library_id: activeId, max_files: 1000 }),
+      });
+      await refreshCurrent();
+      await loadSideData(activeId);
+      const suffix = result.error_count ? `，${result.error_count} 个文件跳过或失败` : "";
+      onNotice(`已检查文件夹，提交或复用 ${result.submitted_count} 个导入任务${suffix}`);
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "扫描 Windows 文件夹失败");
+    } finally {
+      setScanLoading(false);
     }
   }
 
@@ -1082,11 +1127,18 @@ export function KnowledgeWorkbench({
       </aside>
     </section>}
 
-    {managementView === "browse" && activeLibrary.kind !== "association" && <section className="ingest-dock ingest-dock-v2">
-      <div><span className="step-chip">导入新资料</span><h2>添加文件或文件夹</h2><p>提交后会在后台处理。你可以离开此页，再到“导入进度”查看结果。</p></div>
-      <label><span>文件或文件夹位置</span><input value={ingestPath} onChange={(event) => setIngestPath(event.target.value)}/><small>位置必须在资料服务允许读取的范围内。</small></label>
-      <label><span>放入哪个分类</span><select value={selectedNodeId ?? ""} onChange={(event) => setSelectedNodeId(event.target.value)}>{allNodes.filter((node) => node.kind === "physical").map((node) => <option value={node.id} key={node.id}>{node.name}</option>)}</select></label>
-      <button className="primary-button compact" onClick={() => void enqueueIngest()}>开始导入</button>
+    {managementView === "browse" && activeLibrary.kind !== "association" && <section className="ingest-dock ingest-dock-v2 windows-ingest-dock">
+      <div><span className="step-chip">从 Windows 导入</span><h2>自动检查这个知识库的文件夹</h2><p>系统每 5 分钟自动扫描；文件连续稳定 30 秒后才会导入。也可以点击右侧按钮立即检查。</p></div>
+      <div className="windows-folder-card"><span>Windows 原始资料目录</span><code>{activeSourceFolder?.windows}</code><small>可以继续在里面创建任意子文件夹。</small></div>
+      <button className="primary-button compact scan-folder-button" disabled={scanLoading} onClick={() => void scanLibraryFolder()}>{scanLoading ? "正在扫描…" : "立即扫描"}</button>
+      <details className="advanced-section ingest-specific-file">
+        <summary>高级：导入一个指定文件</summary>
+        <div className="specific-file-fields">
+          <label><span>WSL 文件位置</span><input value={ingestPath} onChange={(event) => setIngestPath(event.target.value)}/><small>必须位于 /mnt/e/RAG 内。</small></label>
+          <label><span>放入哪个分类</span><select value={selectedNodeId ?? ""} onChange={(event) => setSelectedNodeId(event.target.value)}>{allNodes.filter((node) => node.kind === "physical").map((node) => <option value={node.id} key={node.id}>{node.name}</option>)}</select></label>
+          <button className="outline-button" onClick={() => void enqueueIngest()}>导入这个文件</button>
+        </div>
+      </details>
     </section>}
 
     {managementView === "jobs" && <section className="governance-panel">

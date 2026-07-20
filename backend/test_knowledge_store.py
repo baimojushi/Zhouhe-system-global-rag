@@ -91,6 +91,24 @@ class KnowledgeStoreTest(unittest.TestCase):
         tagged = self.store.set_document_tags(document["id"], [tag["id"]])
         self.assertEqual("需复核", tagged["tags"][0]["name"])
 
+    def test_find_document_by_windows_source_path(self):
+        document = self.store.create_document(
+            "production",
+            "手册.md",
+            "pr-unclassified",
+            source_path="/mnt/e/RAG/生产文档/手册.md",
+            content_hash="abc",
+        )
+        found = self.store.find_document_by_source_path(
+            "production", "/mnt/e/RAG/生产文档/手册.md"
+        )
+        self.assertEqual(found["id"], document["id"])
+        self.assertIsNone(
+            self.store.find_document_by_source_path(
+                "production", "/mnt/e/RAG/生产文档/不存在.md"
+            )
+        )
+
     def test_archive_branch_moves_documents_to_unclassified(self):
         document = self.store.create_document(
             "production", "向量故障.md", "pr-vector", content_hash="hash-vector"

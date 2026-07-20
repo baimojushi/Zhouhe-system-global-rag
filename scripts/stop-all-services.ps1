@@ -54,6 +54,14 @@ fi
 sleep 1
 pkill -TERM -f '[r]ag_gateway.py' 2>/dev/null || true
 rm -f /opt/global-rag/run/gateway.pid
+if [ -s /opt/global-rag/run/ingest-worker.pid ]; then
+  worker_pid=$(cat /opt/global-rag/run/ingest-worker.pid)
+  if [ -r /proc/$worker_pid/cmdline ] && tr '\0' ' ' < /proc/$worker_pid/cmdline | grep -q ingest_worker.py; then
+    kill -TERM $worker_pid 2>/dev/null || true
+  fi
+fi
+pkill -TERM -f '[i]ngest_worker.py' 2>/dev/null || true
+rm -f /opt/global-rag/run/ingest-worker.pid
 '@
 # Use wsl.exe with pipe to deliver bash script via stdin (PS 5.1 doesn't support <<<)
 $gatewayStopScript | & wsl.exe -d $Distro -u $WslUser bash -s
@@ -74,4 +82,4 @@ Write-Host "[5/5] 清理本项目运行记录..." -ForegroundColor Cyan
 if (Test-Path $RuntimeDir) {
   Get-ChildItem -LiteralPath $RuntimeDir -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 }
-Write-Host "[OK] 本项目服务已停止。未调用 wsl --shutdown，也未终止无关端口进程。" -ForegroundColor Green
+Write-Host "[OK] 本项目服务已停止。E:\RAG 原始资料未改动；未调用 wsl --shutdown，也未终止无关端口进程。" -ForegroundColor Green

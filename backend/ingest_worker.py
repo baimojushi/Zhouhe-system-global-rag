@@ -36,6 +36,7 @@ from weaviate.auth import AuthApiKey
 from FlagEmbedding import FlagModel
 
 from knowledge_store import KnowledgeStore, StoreConflict
+from ingest_service import scan_ingest_folders
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -59,7 +60,7 @@ CONTROL_DB_PATH = os.environ.get(
 )
 INGEST_ROOTS = [
     Path(p) for p in
-    os.environ.get("RAG_INGEST_ROOTS", "/opt/global-rag/kb").split(":")
+    os.environ.get("RAG_INGEST_ROOTS", "/mnt/e/RAG").split(os.pathsep)
     if p.strip()
 ]
 
@@ -302,10 +303,48 @@ def heartbeat_loop(
             break
 
 
+def auto_scan_loop(
+    store: KnowledgeStore,
+    interval_seconds: int,
+    stability_seconds: int,
+) -> None:
+    """Periodically discover stable files under E:\\RAG and queue them."""
+    log.info(
+        "Automatic E:\\RAG scan enabled (interval=%ds, stability=%ds)",
+        interval_seconds,
+        stability_seconds,
+    )
+    while not _shutdown.is_set():
+        try:
+            result = scan_ingest_folders(
+                store,
+                max_files=int(os.environ.get("RAG_AUTO_SCAN_MAX_FILES", "5000")),
+                actor="automatic-folder-scanner",
+                stability_seconds=stability_seconds,
+                wait_fn=_shutdown.wait,
+            )
+            if result["status"] == "cancelled":
+                break
+            log.info(
+                "Automatic scan: discovered=%d stable=%d submitted=%d deferred=%d errors=%d",
+                result["discovered_count"],
+                result["stable_count"],
+                result["submitted_count"],
+                result["unstable_count"],
+                result["error_count"],
+            )
+        except Exception as exc:
+            log.error("Automatic E:\\RAG scan failed: %s", exc, exc_info=True)
+        if _shutdown.wait(max(30, interval_seconds)):
+            break
+
+
 def run_worker(
     poll_interval: float = 5.0,
     lease_seconds: int = 300,
     run_once: bool = False,
+    auto_scan_seconds: int = 300,
+    stability_seconds: int = 30,
 ) -> None:
     """Main worker loop."""
     store = KnowledgeStore(CONTROL_DB_PATH)
@@ -313,6 +352,16 @@ def run_worker(
         "Ingest worker %s started (db=%s, poll=%.1fs, lease=%ds)",
         _worker_id, CONTROL_DB_PATH, poll_interval, lease_seconds,
     )
+
+    scan_thread: Optional[threading.Thread] = None
+    if auto_scan_seconds > 0 and not run_once:
+        scan_thread = threading.Thread(
+            target=auto_scan_loop,
+            args=(store, auto_scan_seconds, max(0, stability_seconds)),
+            name="rag-folder-scanner",
+            daemon=True,
+        )
+        scan_thread.start()
 
     while not _shutdown.is_set():
         reclaimed = store.release_expired_leases()
@@ -359,6 +408,8 @@ def run_worker(
         if run_once:
             break
 
+    if scan_thread is not None:
+        scan_thread.join(timeout=2)
     log.info("Ingest worker %s shutting down", _worker_id)
 
 
@@ -379,6 +430,18 @@ def main() -> int:
                         help="Job lease duration in seconds (default: 300)")
     parser.add_argument("--once", action="store_true",
                         help="Process one job and exit (for testing)")
+    parser.add_argument(
+        "--auto-scan-seconds",
+        type=int,
+        default=int(os.environ.get("RAG_AUTO_SCAN_SECONDS", "300")),
+        help="Seconds between E:\\RAG scans; 0 disables automatic scanning",
+    )
+    parser.add_argument(
+        "--stability-seconds",
+        type=int,
+        default=int(os.environ.get("RAG_FILE_STABILITY_SECONDS", "30")),
+        help="File size/mtime stability window before queueing",
+    )
     args = parser.parse_args()
 
     signal.signal(signal.SIGTERM, _handle_signal)
@@ -388,6 +451,8 @@ def main() -> int:
         poll_interval=args.poll_interval,
         lease_seconds=args.lease_seconds,
         run_once=args.once,
+        auto_scan_seconds=args.auto_scan_seconds,
+        stability_seconds=args.stability_seconds,
     )
     return 0
 

@@ -16,6 +16,13 @@ if ($GemmaPort -eq 0) { $GemmaPort = $(if ($GemmaProfile -eq "q8") { 8002 } else
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $RuntimeDir = Join-Path $RepoRoot ".runtime"
 New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
+$WindowsRagRoot = "E:\RAG"
+$WindowsRagFolders = @("AI工作记录", "学术资料", "生产文档", "个人思维笔记")
+New-Item -ItemType Directory -Force -Path $WindowsRagRoot | Out-Null
+foreach ($folder in $WindowsRagFolders) {
+  New-Item -ItemType Directory -Force -Path (Join-Path $WindowsRagRoot $folder) | Out-Null
+}
+Write-Host "[OK] 原始资料目录 $WindowsRagRoot 已准备（关联知识库不创建文件夹）" -ForegroundColor Green
 
 function Test-Http([string]$Url, [int]$TimeoutSeconds = 3) {
   try {
@@ -83,6 +90,8 @@ Write-Host "[3/5] 重启 RAG Gateway（内置 BGE-M3）..." -ForegroundColor Cya
 # Write gateway start script to temp file in WSL to avoid PS string escaping issues
 $gatewayStartScript = @'
 mkdir -p /opt/global-rag/run /opt/global-rag/logs
+export RAG_INGEST_ROOTS=/mnt/e/RAG
+mkdir -p "/mnt/e/RAG/AI工作记录" "/mnt/e/RAG/学术资料" "/mnt/e/RAG/生产文档" "/mnt/e/RAG/个人思维笔记"
 if [ -s /opt/global-rag/run/gateway.pid ]; then
   oldpid=$(cat /opt/global-rag/run/gateway.pid)
   if [ -r /proc/$oldpid/cmdline ] && tr '\0' ' ' < /proc/$oldpid/cmdline | grep -q rag_gateway.py; then
@@ -90,8 +99,17 @@ if [ -s /opt/global-rag/run/gateway.pid ]; then
   fi
 fi
 pkill -TERM -f '[r]ag_gateway.py' 2>/dev/null || true
+if [ -s /opt/global-rag/run/ingest-worker.pid ]; then
+  worker_pid=$(cat /opt/global-rag/run/ingest-worker.pid)
+  if [ -r /proc/$worker_pid/cmdline ] && tr '\0' ' ' < /proc/$worker_pid/cmdline | grep -q ingest_worker.py; then
+    kill $worker_pid 2>/dev/null || true
+  fi
+fi
+pkill -TERM -f '[i]ngest_worker.py' 2>/dev/null || true
 sleep 2
 cd /opt/global-rag
+nohup env RAG_INGEST_ROOTS=/mnt/e/RAG RAG_AUTO_SCAN_SECONDS=300 RAG_FILE_STABILITY_SECONDS=30 /opt/global-rag/venv/bin/python3 /opt/global-rag/ingest_worker.py >> /opt/global-rag/logs/ingest_worker.log 2>&1 &
+echo $! > /opt/global-rag/run/ingest-worker.pid
 nohup /opt/global-rag/venv/bin/python3 /opt/global-rag/rag_gateway.py --port 9100 >> /opt/global-rag/logs/gateway.log 2>&1 &
 echo $! > /opt/global-rag/run/gateway.pid
 '@
@@ -101,6 +119,7 @@ $tmpGatewayScript = "/tmp/rag-start-gateway-${ts}.sh"
 # Pipe script to wsl bash via stdin (PS 5.1 doesn't support <<<)
 $gatewayStartScript | & wsl.exe -d $Distro -u $WslUser bash -c "cat > '$tmpGatewayScript' && chmod +x '$tmpGatewayScript' && bash '$tmpGatewayScript' && rm '$tmpGatewayScript'"
 Wait-Http "RAG Gateway" "http://127.0.0.1:$GatewayPort/health" 240
+Wait-Wsl "摄取 Worker" "test -s /opt/global-rag/run/ingest-worker.pid && kill -0 `$(cat /opt/global-rag/run/ingest-worker.pid)" 30
 
 Write-Host "[4/5] 重启 Web GUI..." -ForegroundColor Cyan
 $uiPidFile = Join-Path $RuntimeDir "ui.pid"
@@ -149,5 +168,6 @@ Write-Host ""
 Write-Host "全部服务已就绪" -ForegroundColor Green
 Write-Host "  GUI       http://127.0.0.1:$UiPort"
 Write-Host "  Gateway   http://127.0.0.1:$GatewayPort/health"
+Write-Host "  原始资料  E:\RAG"
 Write-Host "  Gemma     http://127.0.0.1:$GemmaPort/health"
 Write-Host "  Weaviate  http://127.0.0.1:8080/v1/.well-known/ready"

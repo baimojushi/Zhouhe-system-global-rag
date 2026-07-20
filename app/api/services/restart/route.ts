@@ -54,6 +54,25 @@ function runPs(command: string): Promise<{ ok: boolean; stdout: string; stderr: 
   });
 }
 
+async function ensureWindowsRagFolders() {
+  return runPs(
+    "$root='E:\\RAG'; @('AI工作记录','学术资料','生产文档','个人思维笔记') | ForEach-Object { New-Item -ItemType Directory -Force -Path (Join-Path $root $_) | Out-Null }"
+  );
+}
+
+async function restartGatewayAndWorker() {
+  await runWsl(
+    "tmux kill-session -t rag-gateway 2>/dev/null; tmux kill-session -t rag-ingest-worker 2>/dev/null; sleep 1"
+  );
+  const worker = await runWsl(
+    "tmux new-session -d -s rag-ingest-worker 'cd /opt/global-rag && source venv/bin/activate && export RAG_INGEST_ROOTS=/mnt/e/RAG RAG_AUTO_SCAN_SECONDS=300 RAG_FILE_STABILITY_SECONDS=30 && python3 ingest_worker.py'"
+  );
+  if (!worker.ok) return worker;
+  return runWsl(
+    "tmux new-session -d -s rag-gateway 'cd /opt/global-rag && source venv/bin/activate && export RAG_INGEST_ROOTS=/mnt/e/RAG && python3 rag_gateway.py --port 9100 --host 0.0.0.0'"
+  );
+}
+
 export async function POST(request: NextRequest) {
   let body: { service: string; profile?: string };
   try {
@@ -69,13 +88,11 @@ export async function POST(request: NextRequest) {
 
   // Gateway — kill + restart via tmux
   if (service === "gateway") {
-    await runWsl("tmux kill-session -t rag-gateway 2>/dev/null; sleep 1");
-    const result = await runWsl(
-      "tmux new-session -d -s rag-gateway 'cd /opt/global-rag && source venv/bin/activate && python3 rag_gateway.py --port 9100 --host 0.0.0.0'"
-    );
+    await ensureWindowsRagFolders();
+    const result = await restartGatewayAndWorker();
     return NextResponse.json({
       ok: result.ok,
-      message: result.ok ? "RAG Gateway 正在重启" : "Gateway 重启失败: " + result.stderr.slice(0, 200),
+      message: result.ok ? "RAG Gateway 与资料导入服务正在重启" : "Gateway 重启失败: " + result.stderr.slice(0, 200),
     });
   }
 
@@ -116,11 +133,8 @@ export async function POST(request: NextRequest) {
 
   // All
   if (service === "all") {
-    // Restart gateway
-    await runWsl("tmux kill-session -t rag-gateway 2>/dev/null; sleep 1");
-    await runWsl(
-      "tmux new-session -d -s rag-gateway 'cd /opt/global-rag && source venv/bin/activate && python3 rag_gateway.py --port 9100 --host 0.0.0.0'"
-    );
+    await ensureWindowsRagFolders();
+    await restartGatewayAndWorker();
     // Restart Weaviate
     await runWsl("cd /opt/global-rag/stack && docker compose restart weaviate 2>/dev/null");
     // Restart Gemma
