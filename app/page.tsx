@@ -303,12 +303,13 @@ export default function Home() {
   const [view, setView] = useState<View>("search");
   const [settings, setSettings] = useState<Settings>(defaultSettings);
   const [skyFrame, setSkyFrame] = useState<SkyFrame>(fallbackSkyFrame);
-  const [query, setQuery] = useState("WSL2 中的部署与故障排查");
+  const [query, setQuery] = useState("");
   const [scope, setScope] = useState("all");
   const [alpha, setAlpha] = useState(65);
   const [topK, setTopK] = useState(6);
-  const [results, setResults] = useState<SearchResult[]>(demoResults);
+  const [results, setResults] = useState<SearchResult[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
+  const [hasSearched, setHasSearched] = useState(false);
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState("");
   const [answer, setAnswer] = useState("");
@@ -382,6 +383,9 @@ export default function Home() {
     event?.preventDefault();
     if (!query.trim()) return;
     setLoading(true);
+    setHasSearched(true);
+    setResults([]);
+    setSelected([]);
     setAnswer("");
     try {
       if (settings.demoMode) {
@@ -641,14 +645,15 @@ export default function Home() {
 
               <div className="answer-panel">
                 <div className="answer-head"><div><span className="section-kicker">整理回答</span><h2>根据资料生成回答</h2></div><button onClick={generateAnswer} disabled={answering || !results.length} className="outline-button"><Icon name="spark"/>{answering ? "正在整理" : "生成回答"}</button></div>
-                {answer ? <p className="answer-text">{answer}</p> : <p className="empty-answer">可以先勾选右侧最可信的资料，再点击“生成回答”。如果不选择，系统会默认使用前三条结果。回答由本机模型生成，并保留资料出处。</p>}
+                {answer ? <p className="answer-text">{answer}</p> : !hasSearched ? <div className="answer-empty-state"><span>空</span><div><b>尚未开始检索</b><p>输入问题并完成检索后，可以在这里根据找到的资料生成回答。</p></div></div> : results.length === 0 ? <div className="answer-empty-state"><span>空</span><div><b>暂时没有可用资料</b><p>找到可靠资料后，才可以生成有出处的回答。</p></div></div> : <p className="empty-answer">可以先勾选右侧最可信的资料，再点击“生成回答”。如果不选择，系统会默认使用前三条结果。</p>}
               </div>
             </section>
 
             <section className="results-column">
               <div className="results-head"><div><span className="section-kicker">找到的资料</span><h2>可用资料</h2></div><div className="result-count"><b>{results.length}</b><span>条结果</span></div></div>
-              <div className="citation-summary"><span>已选择 <b>{selected.length}</b> 条用于生成回答</span>{selected.length > 0 && <button onClick={() => setSelected([])}>取消全部选择</button>}</div>
+              {hasSearched && results.length > 0 && <div className="citation-summary"><span>已选择 <b>{selected.length}</b> 条用于生成回答</span>{selected.length > 0 && <button onClick={() => setSelected([])}>取消全部选择</button>}</div>}
               <div className="result-list" aria-live="polite">
+                {loading && <div className="empty-state search-loading-state"><span className="loading-mark"/><h3>正在查找资料</h3><p>系统正在比较问题与知识库内容。</p></div>}
                 {results.map((item, index) => (
                   <article className={`result-card ${selected.includes(item.id) ? "cited" : ""}`} key={item.id} style={{ animationDelay: `${index * 45}ms` }}>
                     <div className="result-meta"><span className="rank">{String(index + 1).padStart(2, "0")}</span><div className="tag-row">{item.tags.map((tag) => <span key={tag}>{tag}</span>)}</div><span className="score">{Math.round(item.score * 100)}<small>%</small></span></div>
@@ -659,7 +664,7 @@ export default function Home() {
                     <div className="card-foot"><span>相关度</span><div className="score-line"><i style={{ width: `${item.score * 100}%` }}/></div><button onClick={() => toggleCitation(item.id)} className={selected.includes(item.id) ? "selected" : ""}><Icon name={selected.includes(item.id) ? "check" : "quote"} size={17}/>{selected.includes(item.id) ? "已引用" : "引用"}</button></div>
                   </article>
                 ))}
-                {!results.length && <div className="empty-state"><span>无</span><h3>没有找到可靠依据</h3><p>尝试扩大检索范围、调整关键词或提高返回数量。</p></div>}
+                {!loading && !results.length && (hasSearched ? <div className="empty-state"><span>无</span><h3>没有找到可靠资料</h3><p>可以换一种说法、扩大检索范围，或增加显示结果数量。</p></div> : <div className="empty-state search-initial-state"><span>空</span><h3>尚未开始检索</h3><p>输入问题并点击“开始检索”，找到的资料会显示在这里。</p></div>)}
               </div>
             </section>
           </div>

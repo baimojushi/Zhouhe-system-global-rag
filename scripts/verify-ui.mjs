@@ -15,6 +15,8 @@ try {
 
   const html = await pageResponse.text();
   if (!/<main[^>]+class="[^"]*\bapp-shell\b/.test(html)) fail("主页缺少应用外壳，可能返回了错误页面");
+  if (!html.includes("尚未开始检索")) fail("知识检索页没有显示默认空状态");
+  if (html.includes("WSL2 全局混合检索与上下文记忆部署方案")) fail("知识检索页仍在初始状态展示演示结果");
 
   const stylesheets = [...html.matchAll(/<link[^>]+rel="stylesheet"[^>]+href="([^"]+)"/g)]
     .map((match) => match[1]);
