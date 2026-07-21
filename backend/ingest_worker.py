@@ -33,7 +33,7 @@ os.environ.setdefault("HF_HOME", "/opt/global-rag/cache/huggingface")
 
 import weaviate
 from weaviate.auth import AuthApiKey
-from FlagEmbedding import FlagModel
+from embedding_client import encode
 
 from knowledge_store import KnowledgeStore, StoreConflict
 from ingest_service import scan_ingest_folders
@@ -73,11 +73,10 @@ _shutdown = threading.Event()
 
 
 # ---------------------------------------------------------------------------
-# Weaviate + Model singletons
+# Weaviate singleton (embedding delegated to remote service)
 # ---------------------------------------------------------------------------
 
 _weaviate_client: Optional[weaviate.WeaviateClient] = None
-_model: Optional[FlagModel] = None
 _collection_cache: dict[str, Any] = {}
 
 
@@ -100,15 +99,6 @@ def get_weaviate_client() -> weaviate.WeaviateClient:
         )
         log.info("Weaviate client connected (%s:%d)", WEAVIATE_HOST, WEAVIATE_PORT)
     return _weaviate_client
-
-
-def get_model() -> FlagModel:
-    global _model
-    if _model is None:
-        log.info("Loading BGE-M3 model...")
-        _model = FlagModel("BAAI/bge-m3", cpu="CPU", use_fp16=False)
-        log.info("BGE-M3 loaded")
-    return _model
 
 
 def get_library_collection(library_id: str, collection_name: str):
@@ -238,9 +228,8 @@ def process_job(job: dict[str, Any], store: KnowledgeStore) -> tuple[int, str]:
         log.warning("Job %s: no chunks produced from %s", job["id"], source_path)
         return 0, collection_name
 
-    model = get_model()
     texts_to_embed = [f"{source_name} {chunk}" for chunk in chunks]
-    vectors = model.encode(texts_to_embed).tolist()
+    vectors = encode(texts_to_embed, priority="low")
 
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     batch = []

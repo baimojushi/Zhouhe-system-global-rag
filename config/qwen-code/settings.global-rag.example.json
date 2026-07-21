@@ -1,0 +1,14 @@
+{
+  "mcp": {
+    "allowed": ["global-rag"]
+  },
+  "mcpServers": {
+    "global-rag": {
+      "httpUrl": "http://127.0.0.1:9101/mcp",
+      "timeout": 15000,
+      "discoveryTimeoutMs": 10000,
+      "includeTools": ["search_global_knowledge"],
+      "trust": true
+    }
+  }
+}

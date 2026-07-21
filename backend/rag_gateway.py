@@ -30,6 +30,8 @@ import hashlib
 import hmac
 import json
 import mimetypes
+import threading
+import time
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
@@ -45,7 +47,7 @@ from pydantic import BaseModel, Field
 import weaviate
 import weaviate.classes as wvc
 from weaviate.auth import AuthApiKey
-from FlagEmbedding import FlagModel
+from embedding_client import encode, encode_one, EmbeddingServiceError
 
 try:
     from query_rewriter import retrieve_with_optional_rewrite
@@ -66,6 +68,17 @@ from ingest_layout import (
     layout_status,
 )
 from ingest_service import queue_ingest_file, scan_ingest_folders
+from rag_retrieval_core import (
+    CircuitBreaker,
+    SearchValidationError,
+    TTLCache,
+    candidate_limit,
+    choose_alpha,
+    compact_evidence,
+    merge_library_results,
+    normalize_query,
+    validate_libraries,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -109,16 +122,91 @@ weaviate_client = weaviate.connect_to_local(
 knowledge_coll = weaviate_client.collections.get("KnowledgeChunk")
 context_coll = weaviate_client.collections.get("ContextMemory")
 
-# Lazy load model
-model = None
+# ---------------------------------------------------------------------------
+# Metrics (V1.1)
+# ---------------------------------------------------------------------------
 
-def get_model() -> FlagModel:
-    global model
-    if model is None:
-        log.info("Loading BGE-M3 model...")
-        model = FlagModel("BAAI/bge-m3", cpu="CPU", use_fp16=False)
-        log.info("BGE-M3 loaded OK")
-    return model
+_metrics_lock = threading.Lock()
+_gateway_metrics = {
+    "requests_total": 0,
+    "requests_429": 0,
+    "requests_503": 0,
+    "requests_504": 0,
+    "libraries": {},
+    "latency_ms": [],
+    "max_latency_ms": 0.0,
+}
+_MAX_LATENCY_SAMPLES = int(os.environ.get("RAG_METRICS_LATENCY_SAMPLES", "500"))
+
+
+def _record_library_latency(library_id: str, latency_ms: float) -> None:
+    with _metrics_lock:
+        lib = _gateway_metrics["libraries"].setdefault(library_id, {"count": 0, "total_ms": 0.0, "max_ms": 0.0})
+        lib["count"] += 1
+        lib["total_ms"] += latency_ms
+        if latency_ms > lib["max_ms"]:
+            lib["max_ms"] = latency_ms
+        _gateway_metrics["latency_ms"].append(latency_ms)
+        _gateway_metrics["latency_ms"] = _gateway_metrics["latency_ms"][-_MAX_LATENCY_SAMPLES:]
+        if latency_ms > _gateway_metrics["max_latency_ms"]:
+            _gateway_metrics["max_latency_ms"] = latency_ms
+
+
+def _record_error(code: int) -> None:
+    with _metrics_lock:
+        _gateway_metrics["requests_total"] += 1
+        key = f"requests_{code}"
+        if key in _gateway_metrics:
+            _gateway_metrics[key] += 1
+
+
+def _compute_p95() -> float:
+    """Compute p95 latency from recent samples."""
+    with _metrics_lock:
+        samples = sorted(_gateway_metrics["latency_ms"])
+    if not samples:
+        return 0.0
+    idx = max(0, int(len(samples) * 0.95) - 1)
+    return samples[idx]
+
+
+# ---------------------------------------------------------------------------
+# Warmup: pre-heat embedding service on startup (V1.1)
+# ---------------------------------------------------------------------------
+
+def _warmup_embedding() -> None:
+    """Send a warmup query to pre-load BGE-M3 cache on the embedding service."""
+    try:
+        log.info("Embedding warmup: starting...")
+        _ = encode_one("warmup query", priority="high")
+        log.info("Embedding warmup: done")
+    except Exception as exc:
+        log.warning("Embedding warmup failed (non-fatal): %s", exc)
+
+
+_warmup_thread = threading.Thread(target=_warmup_embedding, daemon=True, name="embed-warmup")
+_warmup_thread.start()
+
+# ---------------------------------------------------------------------------
+# Retrieve query vector (delegated to embedding service)
+# ---------------------------------------------------------------------------
+
+_local_query_vector_cache = TTLCache(
+    max_size=int(os.environ.get("RAG_QUERY_VECTOR_CACHE_SIZE", "2048")),
+    ttl_seconds=float(os.environ.get("RAG_QUERY_VECTOR_CACHE_TTL_SECONDS", "900")),
+)
+
+
+def get_query_vector(query: str) -> list[float]:
+    """Encode via remote embedding service with local L1 cache."""
+    normalized = normalize_query(query)
+    cached = _local_query_vector_cache.get(normalized)
+    if cached is not None:
+        _record_library_latency("__cache_hit__", 0)
+        return cached
+    vec = encode_one(normalized, priority="high")
+    _local_query_vector_cache.put(normalized, vec)
+    return vec
 
 # ---------------------------------------------------------------------------
 # Pydantic Models
@@ -158,6 +246,13 @@ class SearchKnowledgeRequest(BaseModel):
     top_k: int = 5
     library_id: Optional[str] = None
     active_versions_only: bool = True
+
+
+class GlobalSearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=500)
+    library_ids: list[str] = Field(default_factory=list, max_length=4)
+    top_k: int = Field(default=6, ge=1, le=10)
+    mode: str = Field(default="auto", pattern="^(fast|auto|deep)$")
 
 class SearchContextRequest(BaseModel):
     query: str
@@ -208,7 +303,8 @@ def get_active_version_ids(library_id: str = None) -> list[str]:
 
 def hybrid_search(query: str, top_k: int = 5, alpha: float = 0.55,
                   collection=None, filters: dict = None,
-                  library_id: str = None, active_versions_only: bool = True) -> list[dict]:
+                  library_id: str = None, active_versions_only: bool = True,
+                  query_vector: list[float] | None = None) -> list[dict]:
     """Hybrid search with pre-computed vector (self_provided vectors).
 
     Args:
@@ -220,8 +316,7 @@ def hybrid_search(query: str, top_k: int = 5, alpha: float = 0.55,
         library_id: If provided, only search chunks from this library
         active_versions_only: If True, only return chunks from active document versions
     """
-    model = get_model()
-    query_vec = model.encode(query).tolist()
+    query_vec = query_vector if query_vector is not None else get_query_vector(query)
 
     # Build filters
     weaviate_filters = []
@@ -334,6 +429,20 @@ def bm25_search(query: str, top_k: int = 5, scope: str = "global",
 
 app = FastAPI(title="RAG Gateway", version="3.0.0")
 
+_global_search_inflight = asyncio.Semaphore(
+    max(1, int(os.environ.get("RAG_GLOBAL_SEARCH_MAX_INFLIGHT", "4")))
+)
+_library_query_slots = threading.BoundedSemaphore(
+    max(1, int(os.environ.get("RAG_LIBRARY_QUERY_WORKERS", "4")))
+)
+_library_breakers = {
+    library_id: CircuitBreaker(
+        failure_threshold=max(1, int(os.environ.get("RAG_LIBRARY_BREAKER_FAILURES", "3"))),
+        recovery_seconds=max(1.0, float(os.environ.get("RAG_LIBRARY_BREAKER_RECOVERY_SECONDS", "15"))),
+    )
+    for library_id in ("ai-work", "academic", "production", "notes")
+}
+
 # CORS: Allow frontend (port 3000) to access Gateway (port 9100)
 app.add_middleware(
     CORSMiddleware,
@@ -379,7 +488,38 @@ async def health():
     return {
         "status": "ok",
         "weaviate": "connected",
-        "model": "loaded" if model is not None else "loading",
+        "embedding_service": "remote",
+    }
+
+
+@app.get("/v1/gateway/metrics")
+async def gateway_metrics():
+    """V1.1: running metrics for monitoring and p95-based tuning."""
+    from embedding_client import get_metrics as get_embedding_client_metrics
+
+    p95_ms = _compute_p95()
+    with _metrics_lock:
+        libs = dict(_gateway_metrics["libraries"])
+        total = _gateway_metrics["requests_total"]
+        errors_429 = _gateway_metrics["requests_429"]
+        errors_503 = _gateway_metrics["requests_503"]
+        errors_504 = _gateway_metrics["requests_504"]
+        max_latency = _gateway_metrics["max_latency_ms"]
+    embed_metrics = get_embedding_client_metrics()
+
+    return {
+        "requests_total": total,
+        "errors_429": errors_429,
+        "errors_503": errors_503,
+        "errors_504": errors_504,
+        "p95_latency_ms": round(p95_ms, 2),
+        "max_latency_ms": round(max_latency, 2),
+        "libraries": {k: {
+            "count": v["count"],
+            "avg_ms": round(v["total_ms"] / v["count"], 2) if v["count"] else 0,
+            "max_ms": round(v["max_ms"], 2),
+        } for k, v in libs.items()},
+        "embedding_client": embed_metrics,
     }
 
 @app.post("/v1/retrieve")
@@ -441,9 +581,8 @@ async def rewrite_capabilities():
 async def ingest_text(request: IngestTextRequest):
     """Ingest raw text as a knowledge chunk."""
     try:
-        model = get_model()
         search_text = f"{request.title or ''} {request.heading or ''} {request.text}"
-        vector = model.encode(search_text).tolist()
+        vector = encode_one(search_text, priority="high")
         
         import hashlib
         import time
@@ -476,8 +615,7 @@ async def ingest_text(request: IngestTextRequest):
 async def store_memory(request: MemoryRequest):
     """Store context memory."""
     try:
-        model = get_model()
-        vector = model.encode(request.content).tolist()
+        vector = encode_one(request.content, priority="high")
         
         created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         
@@ -529,12 +667,132 @@ async def search_knowledge_tool(request: SearchKnowledgeRequest):
         log.error(f"Search knowledge error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+def _search_library_sync(
+    query: str,
+    library_id: str,
+    limit: int,
+    alpha: float,
+    query_vector: list[float],
+) -> list[dict]:
+    # Keep the slot until the worker thread really returns.  Cancelling an
+    # asyncio.to_thread future cannot stop the underlying blocking SDK call.
+    with _library_query_slots:
+        return hybrid_search(
+            query=query,
+            top_k=limit,
+            alpha=alpha,
+            filters={"scope": "global"},
+            library_id=library_id,
+            active_versions_only=True,
+            query_vector=query_vector,
+        )
+
+
+@app.post("/v1/retrieve/global")
+async def search_global_knowledge(request: GlobalSearchRequest):
+    """Search every selected document library with one embedding and partial-failure isolation."""
+    started = time.monotonic()
+    try:
+        query = normalize_query(request.query)
+        library_ids = validate_libraries(request.library_ids)
+    except SearchValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    queue_timeout = max(0.1, float(os.environ.get("RAG_GLOBAL_SEARCH_QUEUE_TIMEOUT_SECONDS", "2")))
+    search_timeout = max(0.5, float(os.environ.get("RAG_LIBRARY_SEARCH_TIMEOUT_SECONDS", "8")))
+    embedding_timeout = max(0.5, float(os.environ.get("RAG_QUERY_EMBEDDING_TIMEOUT_SECONDS", "12")))
+
+    # V1.1: p95 adaptive timeout — widen if observed latency is tight
+    p95 = _compute_p95()
+    if p95 > 0:
+        search_timeout = max(search_timeout, p95 * 2.5 / 1000)
+        embedding_timeout = max(embedding_timeout, p95 * 1.5 / 1000)
+
+    acquired = False
+    try:
+        await asyncio.wait_for(_global_search_inflight.acquire(), timeout=queue_timeout)
+        acquired = True
+    except asyncio.TimeoutError as exc:
+        _record_error(429)
+        raise HTTPException(status_code=429, detail="global retrieval queue is full") from exc
+
+    try:
+        try:
+            query_vector = await asyncio.wait_for(
+                asyncio.to_thread(get_query_vector, query),
+                timeout=embedding_timeout,
+            )
+        except asyncio.TimeoutError as exc:
+            _record_error(504)
+            raise HTTPException(status_code=504, detail="query embedding timed out") from exc
+
+        alpha = choose_alpha(query)
+        per_library_limit = candidate_limit(request.mode, request.top_k)
+
+        async def search_one(library_id: str):
+            search_start = time.monotonic()
+            breaker = _library_breakers[library_id]
+            if not breaker.allow():
+                return library_id, [], {"code": "circuit_open", "message": "library temporarily unavailable"}
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _search_library_sync,
+                        query,
+                        library_id,
+                        per_library_limit,
+                        alpha,
+                        query_vector,
+                    ),
+                    timeout=search_timeout,
+                )
+                breaker.success()
+                _record_library_latency(library_id, (time.monotonic() - search_start) * 1000)
+                return library_id, results, None
+            except asyncio.TimeoutError:
+                breaker.failure()
+                return library_id, [], {"code": "timeout", "message": f"search exceeded {search_timeout:g}s"}
+            except Exception as exc:  # isolate a missing/corrupt collection
+                breaker.failure()
+                log.warning("Global search library=%s failed: %s", library_id, exc)
+                return library_id, [], {"code": "backend_error", "message": type(exc).__name__}
+
+        settled = await asyncio.gather(*(search_one(library_id) for library_id in library_ids))
+        result_sets = {library_id: results for library_id, results, error in settled if error is None}
+        errors = {library_id: error for library_id, _results, error in settled if error is not None}
+        if errors and not result_sets:
+            _record_error(503)
+            raise HTTPException(status_code=503, detail={"message": "all selected libraries failed", "libraries": errors})
+
+        merged = merge_library_results(result_sets, top_k=request.top_k)
+        evidence = compact_evidence(
+            merged,
+            snippet_chars=max(300, int(os.environ.get("RAG_GATEWAY_SNIPPET_CHARS", "1400"))),
+            total_chars=max(2000, int(os.environ.get("RAG_GATEWAY_EVIDENCE_CHARS", "14000"))),
+        )
+        return {
+            "schema_version": "1.0",
+            "query": query,
+            "mode": request.mode,
+            "libraries": library_ids,
+            "active_versions_only": True,
+            "alpha": alpha,
+            "degraded": bool(errors),
+            "library_errors": errors,
+            "evidence": evidence,
+            "count": len(evidence),
+            "latency_ms": round((time.monotonic() - started) * 1000, 1),
+        }
+    finally:
+        if acquired:
+            _global_search_inflight.release()
+
 @app.post("/v1/retrieve/search_context")
 async def search_context_tool(request: SearchContextRequest):
     """MCP tool: search context memory."""
     try:
-        model = get_model()
-        query_vec = model.encode(request.query).tolist()
+        query_vec = encode_one(request.query, priority="high")
 
         weaviate_filters = [
             wvc.query.Filter.by_property("session_id").equal(request.session_id)
@@ -573,8 +831,7 @@ async def search_context_tool(request: SearchContextRequest):
 async def remember_tool(request: RememberRequest):
     """MCP tool: remember important content."""
     try:
-        model = get_model()
-        vector = model.encode(request.content).tolist()
+        vector = encode_one(request.content, priority="high")
         
         created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         

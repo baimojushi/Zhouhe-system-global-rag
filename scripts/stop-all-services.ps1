@@ -62,6 +62,22 @@ if [ -s /opt/global-rag/run/ingest-worker.pid ]; then
 fi
 pkill -TERM -f '[i]ngest_worker.py' 2>/dev/null || true
 rm -f /opt/global-rag/run/ingest-worker.pid
+if [ -s /opt/global-rag/run/rag-mcp.pid ]; then
+  mcp_pid=$(cat /opt/global-rag/run/rag-mcp.pid)
+  if [ -r /proc/$mcp_pid/cmdline ] && tr '\0' ' ' < /proc/$mcp_pid/cmdline | grep -q rag_mcp_server.py; then
+    kill -TERM $mcp_pid 2>/dev/null || true
+  fi
+fi
+pkill -TERM -f '[r]ag_mcp_server.py' 2>/dev/null || true
+rm -f /opt/global-rag/run/rag-mcp.pid
+if [ -s /opt/global-rag/run/embedding-service.pid ]; then
+  embed_pid=$(cat /opt/global-rag/run/embedding-service.pid)
+  if [ -r /proc/$embed_pid/cmdline ] && tr '\0' ' ' < /proc/$embed_pid/cmdline | grep -q embedding_service.py; then
+    kill -TERM $embed_pid 2>/dev/null || true
+  fi
+fi
+pkill -TERM -f '[e]mbedding_service.py' 2>/dev/null || true
+rm -f /opt/global-rag/run/embedding-service.pid
 '@
 # Use wsl.exe with pipe to deliver bash script via stdin (PS 5.1 doesn't support <<<)
 $gatewayStopScript | & wsl.exe -d $Distro -u $WslUser bash -s
