@@ -49,6 +49,7 @@ from document_parser import (
     ARTIFACT_ROOT,
 )
 from mineru_client import MinerUConnectionError, MinerUTimeoutError
+from post_parse_filename import rename_after_mineru, recover_pending_file_renames
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -440,8 +441,14 @@ def process_pdf_job(
                 "PDF job %s: reusing cached parse (artifact_dir=%s)",
                 ingest_job_id, cached,
             )
+            indexed_job, rename_outcome = rename_after_mineru(store, job, cached)
+            log.info(
+                "PDF filename stage: job=%s state=%s name=%s",
+                ingest_job_id, rename_outcome.state,
+                Path(indexed_job["source_path"]).name,
+            )
             return _index_from_artifact(
-                store, job, source_path, source_hash, cached,
+                store, indexed_job, indexed_job["source_path"], source_hash, cached,
             )
 
     # Create parse_job record
@@ -484,8 +491,15 @@ def process_pdf_job(
         )
         raise
 
+    artifact_dir = final_parse.get("artifact_dir", "")
+    indexed_job, rename_outcome = rename_after_mineru(store, job, artifact_dir)
+    log.info(
+        "PDF filename stage: job=%s state=%s name=%s",
+        ingest_job_id, rename_outcome.state,
+        Path(indexed_job["source_path"]).name,
+    )
     return _index_from_artifact(
-        store, job, source_path, source_hash, final_parse.get("artifact_dir", ""),
+        store, indexed_job, indexed_job["source_path"], source_hash, artifact_dir,
     )
 
 
@@ -819,6 +833,15 @@ def run_worker(
         "Ingest worker %s started (db=%s, poll=%.1fs, lease=%ds)",
         _worker_id, CONTROL_DB_PATH, poll_interval, lease_seconds,
     )
+
+    # Reconcile the narrow crash window after the same-directory disk rename
+    # but before the SQLite path transaction committed.
+    try:
+        recovered_names = recover_pending_file_renames(store)
+        if recovered_names:
+            log.info("Recovered %d pending PDF filename transactions", recovered_names)
+    except Exception as exc:
+        log.warning("PDF filename recovery failed (non-fatal): %s", exc)
 
     # Recover stale parse jobs from previous run
     try:

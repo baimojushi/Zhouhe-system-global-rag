@@ -1550,6 +1550,12 @@ async def v2_ingest_layout():
         **layout_status(),
         "auto_scan_seconds": int(os.environ.get("RAG_AUTO_SCAN_SECONDS", "300")),
         "stability_seconds": int(os.environ.get("RAG_FILE_STABILITY_SECONDS", "30")),
+        "pdf_auto_rename": os.environ.get("RAG_PDF_AUTO_RENAME", "true").lower()
+        in {"1", "true", "yes", "on"},
+        "pdf_rename_stage": "after_mineru_before_index",
+        "pdf_rename_min_confidence": float(
+            os.environ.get("RAG_PDF_RENAME_MIN_CONFIDENCE", "0.82")
+        ),
     }
 
 
@@ -1592,6 +1598,21 @@ async def v2_scan_ingest_folders(
 @app.get("/v2/jobs")
 async def v2_list_jobs(library_id: Optional[str] = None, limit: int = 50):
     return {"jobs": knowledge_store.list_jobs(library_id, limit)}
+
+
+@app.get("/v2/file-rename-events")
+async def v2_list_file_rename_events(
+    library_id: Optional[str] = None,
+    state: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    _actor: str = Depends(require_management_auth),
+):
+    events = knowledge_store.list_file_rename_events(
+        library_id=library_id, state=state, limit=limit, offset=offset
+    )
+    return {"events": events, "count": len(events)}
+
 @app.post("/v2/jobs/{job_id}:retry")
 async def v2_retry(job_id:str,_actor:str=Depends(require_management_auth)): return knowledge_store.retry_job(job_id)
 @app.post("/v2/jobs/{job_id}:cancel")

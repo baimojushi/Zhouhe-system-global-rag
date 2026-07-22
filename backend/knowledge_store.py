@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 LIBRARY_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 MAX_JOB_RETRIES = 3
 DEFAULT_LEASE_SECONDS = 300
@@ -637,6 +637,35 @@ class KnowledgeStore:
                     ON parse_jobs(external_task_id);
                 CREATE INDEX IF NOT EXISTS idx_parse_jobs_ingest
                     ON parse_jobs(ingest_job_id);
+            """)
+
+        if current_version < 8:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS file_rename_events (
+                    id TEXT PRIMARY KEY,
+                    library_id TEXT NOT NULL REFERENCES libraries(id),
+                    ingest_job_id TEXT NOT NULL REFERENCES ingest_jobs(id),
+                    document_id TEXT NOT NULL REFERENCES documents(id),
+                    version_id TEXT NOT NULL REFERENCES document_versions(id),
+                    content_hash TEXT NOT NULL,
+                    old_path TEXT NOT NULL,
+                    new_path TEXT NOT NULL,
+                    old_name TEXT NOT NULL,
+                    new_name TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    model TEXT NOT NULL DEFAULT '',
+                    confidence REAL NOT NULL DEFAULT 0,
+                    reason TEXT NOT NULL DEFAULT '',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    error TEXT NOT NULL DEFAULT '',
+                    actor TEXT NOT NULL DEFAULT 'mineru-post-parse-renamer',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_file_rename_job
+                    ON file_rename_events(ingest_job_id, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_file_rename_library
+                    ON file_rename_events(library_id, state, updated_at DESC);
             """)
 
     def _seed_defaults(self, conn: sqlite3.Connection) -> None:
@@ -1913,6 +1942,195 @@ class KnowledgeStore:
             return dict(conn.execute(
                 "SELECT * FROM ingest_jobs WHERE id = ?", (job_id,)
             ).fetchone())
+
+    # ------------------------------------------------------------------
+    # PDF filename normalization after MinerU, before vector indexing
+    # ------------------------------------------------------------------
+
+    def create_file_rename_event(
+        self,
+        job: dict[str, Any],
+        content_hash: str,
+        old_path: str,
+        new_path: str,
+        old_name: str,
+        new_name: str,
+        state: str,
+        model: str = "",
+        confidence: float = 0.0,
+        reason: str = "",
+        metadata_json: str = "{}",
+        actor: str = "mineru-post-parse-renamer",
+    ) -> dict[str, Any]:
+        now = utc_now()
+        event_id = new_id("rename")
+        try:
+            metadata = json.loads(metadata_json or "{}")
+        except json.JSONDecodeError as exc:
+            raise StoreValidationError("rename metadata must be valid JSON") from exc
+        with self._transaction() as conn:
+            self._require_library(conn, job["library_id"])
+            conn.execute(
+                """INSERT INTO file_rename_events
+                   (id, library_id, ingest_job_id, document_id, version_id,
+                    content_hash, old_path, new_path, old_name, new_name,
+                    state, model, confidence, reason, metadata_json, error,
+                    actor, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)""",
+                (
+                    event_id, job["library_id"], job["id"], job["document_id"],
+                    job["version_id"], content_hash, old_path, new_path,
+                    old_name, new_name, state, model,
+                    max(0.0, min(float(confidence), 1.0)), reason[:1000],
+                    json.dumps(metadata, ensure_ascii=False), actor, now, now,
+                ),
+            )
+            return dict(conn.execute(
+                "SELECT * FROM file_rename_events WHERE id = ?", (event_id,)
+            ).fetchone())
+
+    def find_file_rename_event(
+        self, ingest_job_id: str, content_hash: str
+    ) -> Optional[dict[str, Any]]:
+        with self._transaction() as conn:
+            row = conn.execute(
+                """SELECT * FROM file_rename_events
+                   WHERE ingest_job_id = ? AND content_hash = ?
+                   ORDER BY updated_at DESC LIMIT 1""",
+                (ingest_job_id, content_hash),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def mark_file_rename_event(
+        self, event_id: str, state: str, error: str = ""
+    ) -> dict[str, Any]:
+        with self._transaction() as conn:
+            result = conn.execute(
+                """UPDATE file_rename_events
+                   SET state = ?, error = ?, updated_at = ? WHERE id = ?""",
+                (state, error[:1000], utc_now(), event_id),
+            )
+            if result.rowcount != 1:
+                raise StoreNotFound(f"rename event '{event_id}' not found")
+            return dict(conn.execute(
+                "SELECT * FROM file_rename_events WHERE id = ?", (event_id,)
+            ).fetchone())
+
+    def apply_pdf_file_rename(
+        self,
+        event_id: str,
+        ingest_job_id: str,
+        document_id: str,
+        version_id: str,
+        old_path: str,
+        new_path: str,
+        new_name: str,
+        new_title: str,
+        new_idempotency_key: str,
+        worker_id: str,
+        actor: str = "mineru-post-parse-renamer",
+        recovery: bool = False,
+    ) -> dict[str, Any]:
+        """Atomically synchronize every control-plane path after disk rename."""
+        now = utc_now()
+        with self._transaction() as conn:
+            event = conn.execute(
+                "SELECT * FROM file_rename_events WHERE id = ?", (event_id,)
+            ).fetchone()
+            job = conn.execute(
+                "SELECT * FROM ingest_jobs WHERE id = ?", (ingest_job_id,)
+            ).fetchone()
+            document = conn.execute(
+                "SELECT * FROM documents WHERE id = ?", (document_id,)
+            ).fetchone()
+            version = conn.execute(
+                "SELECT * FROM document_versions WHERE id = ?", (version_id,)
+            ).fetchone()
+            if not all((event, job, document, version)):
+                raise StoreNotFound("rename transaction references missing records")
+            if event["state"] != "proposed":
+                raise StoreConflict("rename proposal is no longer pending")
+            if not recovery and (
+                job["state"] != "running" or (worker_id and job["worker_id"] != worker_id)
+            ):
+                raise StoreConflict("ingest job lease is not owned by the renaming worker")
+            if job["document_id"] != document_id or job["version_id"] != version_id:
+                raise StoreConflict("rename job/document/version relationship changed")
+            if job["source_path"] != old_path or document["source_path"] != old_path:
+                raise StoreConflict("source path changed before rename commit")
+            duplicate = conn.execute(
+                """SELECT id FROM documents WHERE library_id = ? AND source_path = ?
+                   AND id != ? AND status != 'trash' LIMIT 1""",
+                (job["library_id"], new_path, document_id),
+            ).fetchone()
+            if duplicate:
+                raise StoreConflict("another document already owns the target path")
+            duplicate_key = conn.execute(
+                "SELECT id FROM ingest_jobs WHERE idempotency_key = ? AND id != ? LIMIT 1",
+                (new_idempotency_key, ingest_job_id),
+            ).fetchone()
+            if duplicate_key:
+                raise StoreConflict("target path already has an ingest job")
+
+            conn.execute(
+                """UPDATE documents SET title = ?, source_path = ?, source_name = ?,
+                   revision = revision + 1, updated_at = ? WHERE id = ?""",
+                (new_title, new_path, new_name, now, document_id),
+            )
+            conn.execute(
+                "UPDATE document_versions SET source_uri = ? WHERE id = ?",
+                (new_path, version_id),
+            )
+            conn.execute(
+                """UPDATE ingest_jobs SET source_path = ?, idempotency_key = ?,
+                   updated_at = ? WHERE id = ?""",
+                (new_path, new_idempotency_key, now, ingest_job_id),
+            )
+            conn.execute(
+                """UPDATE file_rename_events SET state = 'applied', error = '',
+                   updated_at = ? WHERE id = ?""",
+                (now, event_id),
+            )
+            conn.execute(
+                """INSERT INTO audit_events
+                   (id, actor, action, target_type, target_id, library_id,
+                    before_json, after_json, trace_id, created_at)
+                   VALUES (?, ?, 'rename_pdf_source', 'document', ?, ?, ?, ?, ?, ?)""",
+                (
+                    new_id("audit"), actor, document_id, job["library_id"],
+                    json.dumps({"source_path": old_path, "source_name": event["old_name"]}, ensure_ascii=False),
+                    json.dumps({"source_path": new_path, "source_name": new_name, "title": new_title}, ensure_ascii=False),
+                    event_id, now,
+                ),
+            )
+            return dict(conn.execute(
+                "SELECT * FROM ingest_jobs WHERE id = ?", (ingest_job_id,)
+            ).fetchone())
+
+    def list_file_rename_events(
+        self,
+        library_id: Optional[str] = None,
+        state: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if library_id:
+            clauses.append("library_id = ?")
+            params.append(library_id)
+        if state:
+            clauses.append("state = ?")
+            params.append(state)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.extend((min(max(int(limit), 1), 500), max(int(offset), 0)))
+        with self._transaction() as conn:
+            rows = conn.execute(
+                f"""SELECT * FROM file_rename_events {where}
+                    ORDER BY updated_at DESC LIMIT ? OFFSET ?""",
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     # ------------------------------------------------------------------
     # Parse Jobs (MinerU integration)

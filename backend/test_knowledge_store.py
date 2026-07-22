@@ -173,9 +173,9 @@ class KnowledgeStoreTest(unittest.TestCase):
         )
         return document, proposal, item
 
-    def test_schema_v6_is_reported_and_reopen_is_idempotent(self):
-        self.assertEqual(6, SCHEMA_VERSION)
-        self.assertEqual(6, self.store.stats()["schema_version"])
+    def test_schema_v8_is_reported_and_reopen_is_idempotent(self):
+        self.assertEqual(8, SCHEMA_VERSION)
+        self.assertEqual(8, self.store.stats()["schema_version"])
         conn = self.store._connect()
         conn.execute(
             "UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'"
@@ -193,7 +193,7 @@ class KnowledgeStoreTest(unittest.TestCase):
             ).fetchall()
         }
         conn.close()
-        self.assertEqual("6", version)
+        self.assertEqual("8", version)
         self.assertIn("applied_document_revision", columns)
     def test_manual_governance_v25(self):
         doc,proposal,item=self._proposal_fixture("人工改派");self.store.approve_proposal_item(proposal["id"],item["id"])
