@@ -4,10 +4,14 @@
 Consumes queued ingest_jobs, parses source files into chunks, embeds them
 with BGE-M3, and writes to per-library Weaviate collections.
 
+PDF files are routed to the MinerU document parsing service for structured
+extraction (markdown, layout, tables).  Text files use the built-in parser.
+
 Features:
   - Task lease with heartbeat (auto-reclaim on expiry)
   - Configurable retry with max_retries per job
   - Per-library Weaviate collection writes
+  - MinerU integration with async task recovery
   - Graceful shutdown on SIGTERM/SIGINT
 
 Usage:
@@ -17,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import logging
 import os
 import signal
@@ -37,6 +42,13 @@ from embedding_client import encode
 
 from knowledge_store import KnowledgeStore, StoreConflict
 from ingest_service import scan_ingest_folders
+from document_parser import (
+    get_parser,
+    submit_and_persist,
+    poll_and_materialize,
+    ARTIFACT_ROOT,
+)
+from mineru_client import MinerUConnectionError, MinerUTimeoutError
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -193,12 +205,478 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
 
 
 # ---------------------------------------------------------------------------
+# PDF detection
+# ---------------------------------------------------------------------------
+
+PDF_SUFFIXES = frozenset({".pdf"})
+
+
+def is_pdf_file(source_path: str) -> bool:
+    return Path(source_path).suffix.casefold() in PDF_SUFFIXES
+
+
+# ---------------------------------------------------------------------------
+# MinerU PDF processing
+# ---------------------------------------------------------------------------
+
+def _chunk_markdown(
+    md_content: str,
+    source_name: str,
+    chunk_size: int = 700,
+    overlap: int = 100,
+) -> list[dict[str, Any]]:
+    """Split MinerU markdown into chunks with heading awareness.
+
+    Returns list of dicts with ``content``, ``heading``, ``chunk_index``.
+    """
+    if not md_content.strip():
+        return []
+
+    lines = md_content.split("\n")
+    chunks: list[dict[str, Any]] = []
+    current_heading = ""
+    buffer: list[str] = []
+    buffer_len = 0
+
+    def flush() -> None:
+        nonlocal buffer, buffer_len
+        text = "\n".join(buffer).strip()
+        if text:
+            chunks.append({
+                "content": text,
+                "heading": current_heading,
+            })
+        buffer = []
+        buffer_len = 0
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            heading_level = len(stripped) - len(stripped.lstrip("#"))
+            if 1 <= heading_level <= 6:
+                flush()
+                current_heading = stripped.lstrip("#").strip()
+                continue
+
+        buffer.append(line)
+        buffer_len += len(line)
+        if buffer_len >= chunk_size:
+            flush()
+            overlap_text = "\n".join(buffer[-3:]) if len(buffer) >= 3 else "\n".join(buffer)
+            buffer = [overlap_text] if overlap_text.strip() else []
+            buffer_len = len(overlap_text)
+
+    flush()
+    return [
+        {"content": c["content"], "heading": c["heading"], "chunk_index": i}
+        for i, c in enumerate(chunks)
+    ]
+
+
+def _chunk_from_content_list(
+    content_list: list[dict[str, Any]],
+    source_name: str,
+    chunk_size: int = 700,
+    overlap: int = 100,
+) -> list[dict[str, Any]]:
+    """Chunk MinerU content_list with page/heading/block-type awareness.
+
+    Each returned chunk dict includes:
+      - content:       assembled text
+      - heading:       current section heading
+      - page:          page number (0-based)
+      - block_type:    dominant block type
+      - asset_refs:    list of referenced image/chart paths
+      - chunk_index:   sequential index
+
+    Skips structural blocks (header, footer, page_number, aside_text).
+    """
+    if not content_list:
+        return []
+
+    # Filter to content-bearing blocks, grouped by page
+    SKIP_TYPES = frozenset({"header", "footer", "page_number", "aside_text"})
+
+    chunks: list[dict[str, Any]] = []
+    current_heading = ""
+    current_page = 0
+    buffer: list[str] = []
+    buffer_len = 0
+    buffer_assets: list[str] = []
+    buffer_types: set[str] = set()
+
+    def flush() -> None:
+        nonlocal buffer, buffer_len, buffer_assets, buffer_types
+        text = "\n".join(buffer).strip()
+        if text:
+            # Determine dominant block type (prefer non-text)
+            dominant = "text"
+            for bt in ("table", "chart", "image", "formula"):
+                if bt in buffer_types:
+                    dominant = bt
+                    break
+            chunks.append({
+                "content": text,
+                "heading": current_heading,
+                "page": current_page,
+                "block_type": dominant,
+                "asset_refs": list(buffer_assets),
+            })
+        buffer = []
+        buffer_len = 0
+        buffer_assets = []
+        buffer_types = set()
+
+    for block in content_list:
+        if not isinstance(block, dict):
+            continue
+
+        btype = block.get("type", "")
+        if btype in SKIP_TYPES:
+            continue
+
+        page = block.get("page_idx", 0)
+
+        # Detect page boundary → flush
+        if page != current_page and buffer:
+            flush()
+            current_page = page
+
+        # Detect heading (text with text_level)
+        if btype == "text" and "text_level" in block:
+            level = block["text_level"]
+            if 1 <= level <= 6:
+                flush()
+                current_heading = block.get("text", "").strip()
+                continue
+
+        # Collect asset references
+        assets: list[str] = []
+        if btype in ("image", "chart"):
+            img = block.get("img_path", "")
+            if img:
+                assets.append(img)
+            # Also add caption as content
+            caption = block.get("image_caption") or block.get("chart_caption") or []
+            if caption:
+                caption_text = " ".join(caption) if isinstance(caption, list) else str(caption)
+                buffer.append(f"[{btype}] {caption_text}")
+                buffer_len += len(buffer[-1])
+        elif btype == "table":
+            # Table content is in the markdown, but we mark the type
+            table_html = block.get("html", block.get("text", ""))
+            if table_html:
+                buffer.append(f"[table] {table_html}")
+                buffer_len += len(buffer[-1])
+
+        # Regular text
+        text = block.get("text", block.get("content", "")).strip()
+        if text:
+            buffer.append(text)
+            buffer_len += len(text)
+
+        buffer_types.add(btype)
+        buffer_assets.extend(assets)
+
+        # Flush if buffer exceeds chunk_size
+        if buffer_len >= chunk_size:
+            flush()
+
+    flush()
+
+    return [
+        {
+            "content": c["content"],
+            "heading": c["heading"],
+            "page": c["page"],
+            "block_type": c["block_type"],
+            "asset_refs": c["asset_refs"],
+            "chunk_index": i,
+        }
+        for i, c in enumerate(chunks)
+    ]
+
+
+def process_pdf_job(
+    job: dict[str, Any],
+    store: KnowledgeStore,
+    force_reparse: bool = False,
+) -> tuple[int, str]:
+    """Process a PDF ingest job via MinerU.
+
+    Creates a parse_job, submits to MinerU, polls until complete,
+    fetches the markdown result, chunks it, embeds, and indexes into Weaviate.
+
+    If ``force_reparse`` is False (default), checks for a cached parse result
+    with the same source_hash + parser_version + config_fingerprint.
+
+    Returns (chunks_indexed, weaviate_collection).
+    """
+    source_path = job["source_path"]
+    library_id = job["library_id"]
+    target_node_id = job["target_node_id"]
+    document_id = job.get("document_id") or ""
+    version_id = job.get("version_id") or ""
+    ingest_job_id = job["id"]
+
+    log.info(
+        "PDF job %s: processing (path=%s)", ingest_job_id, source_path
+    )
+
+    # Compute source hash
+    path = Path(source_path)
+    sha256 = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(64 * 1024), b""):
+            sha256.update(block)
+    source_hash = sha256.hexdigest()
+    config_fingerprint = "v1"
+
+    # Cache lookup: same source_hash + parser_version + config_fingerprint
+    if not force_reparse:
+        cached = _find_cached_parse(store, source_hash, config_fingerprint)
+        if cached is not None:
+            log.info(
+                "PDF job %s: reusing cached parse (artifact_dir=%s)",
+                ingest_job_id, cached,
+            )
+            return _index_from_artifact(
+                store, job, source_path, source_hash, cached,
+            )
+
+    # Create parse_job record
+    parse_job = store.create_parse_job(
+        ingest_job_id=ingest_job_id,
+        document_id=document_id,
+        version_id=version_id,
+        source_hash=source_hash,
+        config_fingerprint=config_fingerprint,
+    )
+    log.info("Created parse_job %s for ingest %s", parse_job["id"], ingest_job_id)
+
+    # Submit to MinerU
+    try:
+        updated = submit_and_persist(store, parse_job, source_path)
+        parse_job_id = updated["id"]
+        external_task_id = updated.get("external_task_id", "")
+        log.info(
+            "Submitted to MinerU: parse_job=%s task=%s",
+            parse_job_id, external_task_id,
+        )
+    except (MinerUConnectionError, RuntimeError) as exc:
+        store.update_parse_job(
+            parse_job["id"], state="failed", error=str(exc)
+        )
+        raise
+
+    # Poll and materialize
+    try:
+        final_parse = poll_and_materialize(
+            store, updated, source_path, document_id, version_id,
+        )
+        log.info(
+            "MinerU parse complete: parse_job=%s artifact_dir=%s",
+            final_parse["id"], final_parse.get("artifact_dir", ""),
+        )
+    except (MinerUTimeoutError, MinerUConnectionError, RuntimeError) as exc:
+        store.update_parse_job(
+            parse_job["id"], state="failed", error=str(exc)
+        )
+        raise
+
+    return _index_from_artifact(
+        store, job, source_path, source_hash, final_parse.get("artifact_dir", ""),
+    )
+
+
+def _find_cached_parse(
+    store: KnowledgeStore,
+    source_hash: str,
+    config_fingerprint: str,
+) -> Optional[str]:
+    """Look for an existing parse result with matching hash + fingerprint.
+
+    Returns the artifact_dir path if a cached result exists, else None.
+    """
+    jobs = store.list_parse_jobs(state="parsed", limit=100)
+    for pj in jobs:
+        if (pj.get("source_hash", "") == source_hash
+                and pj.get("config_fingerprint", "") == config_fingerprint
+                and pj.get("parser_version", "") == "3.4.4"
+                and pj.get("artifact_dir", "")):
+            ad = pj["artifact_dir"]
+            if Path(ad).exists():
+                return ad
+    return None
+
+
+def _index_from_artifact(
+    store: KnowledgeStore,
+    job: dict[str, Any],
+    source_path: str,
+    source_hash: str,
+    artifact_dir: str,
+) -> tuple[int, str]:
+    """Read parsed artifacts, chunk, embed, and index into Weaviate.
+
+    Shared by both fresh parses and cache hits.
+    """
+    library_id = job["library_id"]
+    target_node_id = job["target_node_id"]
+    document_id = job.get("document_id") or ""
+    version_id = job.get("version_id") or ""
+    ingest_job_id = job["id"]
+    path = Path(source_path)
+    source_name = path.name
+
+    md_path = Path(artifact_dir) / "document.md"
+    cl_path = Path(artifact_dir) / "content_list.json"
+
+    md_content = ""
+    content_list: list[dict[str, Any]] = []
+    if md_path.exists():
+        md_content = md_path.read_text(encoding="utf-8")
+    if cl_path.exists():
+        try:
+            raw = cl_path.read_text(encoding="utf-8")
+            parsed = json.loads(raw)
+            if isinstance(parsed, str):
+                parsed = json.loads(parsed)
+            if isinstance(parsed, list):
+                content_list = parsed
+        except (json.JSONDecodeError, ValueError) as exc:
+            log.warning("Failed to parse content_list.json: %s", exc)
+
+    # Chunk
+    if content_list:
+        chunks = _chunk_from_content_list(content_list, source_name)
+    else:
+        chunks = _chunk_markdown(md_content, source_name)
+
+    if not chunks:
+        log.warning("Job %s: no chunks from artifact %s", ingest_job_id, artifact_dir)
+        return 0, ""
+
+    # Embed and index
+    library = store.get_library(library_id)
+    collection_name = library["collection_name"]
+    collection = get_library_collection(library_id, collection_name)
+
+    texts_to_embed = [f"{source_name} {c['content']}" for c in chunks]
+    vectors = encode(texts_to_embed, priority="low")
+
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    batch = []
+    for idx, (chunk, vec) in enumerate(zip(chunks, vectors)):
+        chunk_id = f"{version_id or document_id or source_hash[:16]}-{idx}"
+        asset_refs = chunk.get("asset_refs", [])
+        batch.append(weaviate.classes.data.DataObject(
+            properties={
+                "chunk_id": chunk_id,
+                "content": chunk["content"],
+                "title": source_name,
+                "heading": chunk.get("heading", ""),
+                "source_path": source_path,
+                "source_name": source_name,
+                "source_hash": source_hash[:16],
+                "mime_type": "application/pdf",
+                "page": chunk.get("page", 0),
+                "chunk_index": idx,
+                "scope": "global",
+                "modified_at": now_str,
+                "document_id": document_id,
+                "version_id": version_id,
+                "library_id": library_id,
+                "node_id": target_node_id,
+                "block_type": chunk.get("block_type", "text"),
+                "asset_refs": ",".join(asset_refs) if asset_refs else "",
+            },
+            vector=vec,
+            uuid=str(uuid.uuid5(
+                uuid.NAMESPACE_URL, f"global-rag:{chunk_id}"
+            )),
+        ))
+
+    collection.data.insert_many(batch)
+    log.info(
+        "Job %s: indexed %d chunks into %s (from %s)",
+        ingest_job_id, len(batch), collection_name,
+        "cache" if Path(artifact_dir).exists() else "fresh parse",
+    )
+    return len(batch), collection_name
+
+
+# ---------------------------------------------------------------------------
+# Stale parse job recovery
+# ---------------------------------------------------------------------------
+
+def recover_stale_parse_jobs(store: KnowledgeStore) -> int:
+    """Recover parse jobs that were in 'parsing' state when the worker stopped.
+
+    Polls MinerU for each stale job's external_task_id.  If the task
+    completed while we were away, materialize the result.  If it's still
+    running, leave it in 'parsing' for the next poll cycle.
+
+    Returns the number of recovered jobs.
+    """
+    stale = store.list_parse_jobs(state="parsing", limit=500)
+    if not stale:
+        return 0
+
+    log.info("Found %d stale parse jobs to recover", len(stale))
+    recovered = 0
+    for pj in stale:
+        task_id = pj.get("external_task_id", "")
+        if not task_id:
+            log.warning("Stale parse job %s has no external_task_id, marking failed", pj["id"])
+            store.update_parse_job(pj["id"], state="failed", error="No external_task_id on recovery")
+            continue
+
+        try:
+            parser = get_parser("mineru")
+            if parser is None:
+                log.error("MinerU parser not available for recovery")
+                break
+            status = parser.status(task_id)
+            if status.state == "parsed":
+                log.info("Recovering completed parse job %s (task=%s)", pj["id"], task_id)
+                poll_and_materialize(
+                    store, pj,
+                    pj.get("source_hash", ""),
+                    pj["document_id"],
+                    pj["version_id"],
+                )
+                recovered += 1
+            elif status.state == "failed":
+                log.warning("Stale parse job %s failed on MinerU side: %s", pj["id"], status.error)
+                store.update_parse_job(pj["id"], state="failed", error=status.error)
+            else:
+                log.info("Stale parse job %s still running (state=%s), leaving it", pj["id"], status.state)
+        except MinerUConnectionError as exc:
+            log.warning("Cannot reach MinerU for recovery: %s", exc)
+            break
+        except Exception as exc:
+            log.error("Error recovering parse job %s: %s", pj["id"], exc)
+
+    return recovered
+
+
+# ---------------------------------------------------------------------------
 # Core ingest logic
 # ---------------------------------------------------------------------------
 
 def process_job(job: dict[str, Any], store: KnowledgeStore) -> tuple[int, str]:
-    """Process a single ingest job. Returns (chunks_indexed, weaviate_collection)."""
+    """Process a single ingest job. Returns (chunks_indexed, weaviate_collection).
+
+    PDF files are routed to MinerU; text files use the built-in parser.
+    """
     source_path = job["source_path"]
+
+    # Route PDF files to MinerU
+    if is_pdf_file(source_path):
+        return process_pdf_job(job, store)
+
+    # Text file processing (existing logic)
     library_id = job["library_id"]
     target_node_id = job["target_node_id"]
     document_id = job.get("document_id") or ""
@@ -341,6 +819,14 @@ def run_worker(
         "Ingest worker %s started (db=%s, poll=%.1fs, lease=%ds)",
         _worker_id, CONTROL_DB_PATH, poll_interval, lease_seconds,
     )
+
+    # Recover stale parse jobs from previous run
+    try:
+        recovered = recover_stale_parse_jobs(store)
+        if recovered:
+            log.info("Recovered %d stale parse jobs", recovered)
+    except Exception as exc:
+        log.warning("Parse job recovery failed (non-fatal): %s", exc)
 
     scan_thread: Optional[threading.Thread] = None
     if auto_scan_seconds > 0 and not run_once:

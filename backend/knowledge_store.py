@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 LIBRARY_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 MAX_JOB_RETRIES = 3
 DEFAULT_LEASE_SECONDS = 300
@@ -608,6 +608,36 @@ class KnowledgeStore:
                 created_by TEXT NOT NULL DEFAULT 'local-owner', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                 CHECK(source_document_id != target_document_id), UNIQUE(association_library_id,source_document_id,target_document_id,relation_type));
                 CREATE INDEX IF NOT EXISTS idx_edges_library_status ON knowledge_edges(association_library_id,status,updated_at DESC);""")
+
+        if current_version < 7:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS parse_jobs (
+                    id TEXT PRIMARY KEY,
+                    ingest_job_id TEXT NOT NULL UNIQUE REFERENCES ingest_jobs(id),
+                    document_id TEXT NOT NULL REFERENCES documents(id),
+                    version_id TEXT NOT NULL REFERENCES document_versions(id),
+                    parser_name TEXT NOT NULL DEFAULT 'mineru',
+                    parser_version TEXT NOT NULL DEFAULT '3.4.4',
+                    external_task_id TEXT NOT NULL DEFAULT '',
+                    source_hash TEXT NOT NULL DEFAULT '',
+                    config_fingerprint TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL DEFAULT 'queued',
+                    progress INTEGER NOT NULL DEFAULT 0,
+                    artifact_dir TEXT NOT NULL DEFAULT '',
+                    manifest_json TEXT NOT NULL DEFAULT '{}',
+                    submit_attempts INTEGER NOT NULL DEFAULT 0,
+                    poll_failures INTEGER NOT NULL DEFAULT 0,
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_parse_jobs_state
+                    ON parse_jobs(state, created_at);
+                CREATE INDEX IF NOT EXISTS idx_parse_jobs_external
+                    ON parse_jobs(external_task_id);
+                CREATE INDEX IF NOT EXISTS idx_parse_jobs_ingest
+                    ON parse_jobs(ingest_job_id);
+            """)
 
     def _seed_defaults(self, conn: sqlite3.Connection) -> None:
         now = utc_now()
@@ -1883,6 +1913,154 @@ class KnowledgeStore:
             return dict(conn.execute(
                 "SELECT * FROM ingest_jobs WHERE id = ?", (job_id,)
             ).fetchone())
+
+    # ------------------------------------------------------------------
+    # Parse Jobs (MinerU integration)
+    # ------------------------------------------------------------------
+
+    def create_parse_job(
+        self,
+        ingest_job_id: str,
+        document_id: str,
+        version_id: str,
+        source_hash: str,
+        config_fingerprint: str = "",
+        parser_name: str = "mineru",
+        parser_version: str = "3.4.4",
+    ) -> dict[str, Any]:
+        """Create a parse_job record linked to an ingest_job."""
+        now = utc_now()
+        job_id = f"parse-{uuid.uuid4().hex}"
+        with self._transaction() as conn:
+            conn.execute(
+                """INSERT INTO parse_jobs
+                   (id, ingest_job_id, document_id, version_id,
+                    parser_name, parser_version, source_hash,
+                    config_fingerprint, state, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
+                (job_id, ingest_job_id, document_id, version_id,
+                 parser_name, parser_version, source_hash,
+                 config_fingerprint, now, now),
+            )
+            return dict(conn.execute(
+                "SELECT * FROM parse_jobs WHERE id = ?", (job_id,)
+            ).fetchone())
+
+    def get_parse_job(self, job_id: str) -> Optional[dict[str, Any]]:
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM parse_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_parse_job_by_ingest(self, ingest_job_id: str) -> Optional[dict[str, Any]]:
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM parse_jobs WHERE ingest_job_id = ?", (ingest_job_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_parse_job_by_external(self, external_task_id: str) -> Optional[dict[str, Any]]:
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM parse_jobs WHERE external_task_id = ?", (external_task_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def claim_next_parse_job(
+        self, worker_id: str, lease_seconds: int = 300
+    ) -> Optional[dict[str, Any]]:
+        """Claim the next queued parse job with a lease."""
+        now = utc_now()
+        with self._transaction() as conn:
+            job = conn.execute(
+                """SELECT * FROM parse_jobs
+                   WHERE state = 'queued'
+                   ORDER BY created_at ASC LIMIT 1"""
+            ).fetchone()
+            if job is None:
+                return None
+            lease_until = datetime.fromisoformat(now).timestamp() + lease_seconds
+            lease_until_str = datetime.fromtimestamp(
+                lease_until, tz=timezone.utc
+            ).isoformat(timespec="seconds")
+            conn.execute(
+                """UPDATE parse_jobs SET state = 'submitting', updated_at = ?
+                   WHERE id = ? AND state = 'queued'""",
+                (now, job["id"]),
+            )
+            return dict(conn.execute(
+                "SELECT * FROM parse_jobs WHERE id = ?", (job["id"],)
+            ).fetchone())
+
+    def update_parse_job(
+        self,
+        job_id: str,
+        state: str,
+        external_task_id: str = "",
+        progress: int = 0,
+        artifact_dir: str = "",
+        manifest_json: str = "",
+        error: str = "",
+        submit_attempts: int = 0,
+        poll_failures: int = 0,
+    ) -> Optional[dict[str, Any]]:
+        now = utc_now()
+        with self._transaction() as conn:
+            sets = ["updated_at = ?"]
+            params: list[Any] = [now]
+            if state:
+                sets.append("state = ?")
+                params.append(state)
+            if external_task_id:
+                sets.append("external_task_id = ?")
+                params.append(external_task_id)
+            if progress:
+                sets.append("progress = ?")
+                params.append(progress)
+            if artifact_dir:
+                sets.append("artifact_dir = ?")
+                params.append(artifact_dir)
+            if manifest_json:
+                sets.append("manifest_json = ?")
+                params.append(manifest_json)
+            if error:
+                sets.append("error = ?")
+                params.append(error)
+            if submit_attempts:
+                sets.append("submit_attempts = submit_attempts + ?")
+                params.append(submit_attempts)
+            if poll_failures:
+                sets.append("poll_failures = poll_failures + ?")
+                params.append(poll_failures)
+            params.append(job_id)
+            conn.execute(
+                f"UPDATE parse_jobs SET {', '.join(sets)} WHERE id = ?",
+                params,
+            )
+            row = conn.execute(
+                "SELECT * FROM parse_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_parse_jobs(
+        self,
+        state: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        with self._transaction() as conn:
+            if state:
+                rows = conn.execute(
+                    "SELECT * FROM parse_jobs WHERE state = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    (state, limit, offset),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM parse_jobs ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    (limit, offset),
+                ).fetchall()
+            return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Document Version management

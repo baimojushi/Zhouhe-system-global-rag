@@ -485,10 +485,20 @@ async def store_validation_handler(_request, exc: StoreValidationError):
 
 @app.get("/health")
 async def health():
+    """Health check with parse_job stats."""
+    parse_stats = {"queued": 0, "parsing": 0, "parsed": 0, "failed": 0}
+    try:
+        for state in ("queued", "parsing", "parsed", "failed"):
+            jobs = _store.list_parse_jobs(state=state, limit=1)
+            parse_stats[state] = len(jobs)
+    except Exception:
+        pass
+
     return {
         "status": "ok",
         "weaviate": "connected",
         "embedding_service": "remote",
+        "parse_jobs": parse_stats,
     }
 
 
@@ -826,6 +836,59 @@ async def search_context_tool(request: SearchContextRequest):
     except Exception as e:
         log.error(f"Search context error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Evidence-aware retrieval (V2: document-fair, evidence-first)
+# ---------------------------------------------------------------------------
+
+class EvidenceSearchRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=1000, description="Search query")
+    top_k: int = Field(8, ge=1, le=30)
+    research_mode: str = Field("balanced", pattern=r"^(balanced|evidence|fast)$")
+    alpha: Optional[float] = Field(None, ge=0.0, le=1.0)
+    scope: str = "global"
+    library_ids: Optional[list[str]] = None
+
+
+@app.post("/v1/retrieve/evidence")
+async def evidence_retrieve(request: EvidenceSearchRequest):
+    """Document-fair, evidence-first layered retrieval.
+
+    See ``rag_evidence_retrieval.evidence_search`` for the full pipeline.
+    """
+    try:
+        from rag_evidence_retrieval import evidence_search
+    except ImportError:
+        raise HTTPException(status_code=501, detail="evidence retrieval module not available")
+
+    try:
+        query = normalize_query(request.query)
+        library_ids = validate_libraries(request.library_ids)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    def search_fn(q: str, limit: int, filters: Optional[dict] = None) -> list[dict]:
+        try:
+            return hybrid_search(
+                query=q, top_k=limit, alpha=request.alpha or 0.55,
+                filters=filters or {"scope": request.scope},
+                library_id=None, active_versions_only=True,
+            )
+        except Exception as exc:
+            log.warning(f"Hybrid search in evidence pipeline failed: {exc}")
+            return []
+
+    result = evidence_search(
+        query=query,
+        search_fn=search_fn,
+        top_k=request.top_k,
+        research_mode=request.research_mode,
+        alpha=request.alpha,
+        filters={"scope": request.scope},
+    )
+    return result
+
 
 @app.post("/v1/memory/remember")
 async def remember_tool(request: RememberRequest):
@@ -1619,6 +1682,20 @@ async def ingest_path(request: IngestPathRequest):
         "library_id": request.library_id,
         "target_node": target["id"],
     }
+
+
+@app.get("/v1/parse-jobs")
+async def list_parse_jobs(
+    state: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    actor: str = Depends(require_management_auth),
+):
+    """List parse jobs with optional state filter."""
+    if knowledge_store is None:
+        raise HTTPException(503, "Knowledge store not initialized")
+    jobs = knowledge_store.list_parse_jobs(state=state, limit=min(limit, 500), offset=max(0, offset))
+    return {"jobs": jobs, "total": len(jobs)}
 
 
 @app.post("/v1/taxonomy/proposals")

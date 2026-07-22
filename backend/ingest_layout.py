@@ -24,6 +24,7 @@ SUPPORTED_SUFFIXES = frozenset({
     ".c", ".h", ".cpp", ".hpp", ".sh", ".ps1", ".bat", ".cmd",
     ".json", ".jsonl", ".yaml", ".yml", ".toml", ".ini", ".cfg",
     ".csv", ".tsv", ".sql", ".html", ".htm", ".xml", ".css", ".scss",
+    ".pdf",
 })
 
 
