@@ -39,7 +39,22 @@ def log(msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Kill orphaned multiprocessing zombie processes
+# Step 1a: Clean stale loky temp dirs (causes MinerU BrokenProcessPool)
+# ---------------------------------------------------------------------------
+def cleanup_loky_tmp() -> None:
+    """Remove leftover /tmp/loky-* dirs from dead MinerU processes."""
+    import shutil
+    for entry in Path("/tmp").glob("loky-*"):
+        try:
+            if entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+                log(f"  Removed stale loky dir: {entry.name}")
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Step 1b: Kill orphaned multiprocessing zombie processes
 # ---------------------------------------------------------------------------
 def cleanup_zombies() -> int:
     """Kill leftover multiprocessing.spawn processes. Returns count killed."""
@@ -165,22 +180,26 @@ def start_worker() -> bool:
 def main() -> None:
     log(f"=== cleanup_and_restart.py v{VERSION} ===")
     log("")
-    log("Step 1: Clean zombie processes...")
+    log("Step 1: Clean stale loky temp dirs...")
+    cleanup_loky_tmp()
+    log("")
+    log("Step 2: Clean zombie processes...")
     n = cleanup_zombies()
     log("")
-    log("Step 2: Stop old services...")
+    log("Step 3: Stop old services...")
     stop_services()
     log("")
-    log("Step 3: Reset failed/stale jobs...")
+    log("Step 4: Reset failed/stale jobs...")
     m = reset_jobs()
     log("")
-    log("Step 4: Start embedding service...")
+    log("Step 5: Start embedding service...")
     start_embedding()
     log("")
-    log("Step 5: Start worker...")
+    log("Step 6: Start worker...")
     start_worker()
     log("")
-    log("Step 6: Summary")
+    log("Step 7: Summary")
+    log(f"  Loky cleanup: done")
     log(f"  Zombies cleaned: {n}")
     log(f"  Jobs reset: {m}")
     log("")

@@ -33,7 +33,7 @@ MINERU_API_URL = os.environ.get(
 )
 POLL_INTERVAL = float(os.environ.get("RAG_MINERU_POLL_INTERVAL", "5"))
 MAX_PARSE_SECONDS = int(os.environ.get("RAG_MINERU_MAX_PARSE_SECONDS", "3600"))
-SUBMIT_TIMEOUT = int(os.environ.get("RAG_MINERU_SUBMIT_TIMEOUT_SECONDS", "30"))
+SUBMIT_TIMEOUT = int(os.environ.get("RAG_MINERU_SUBMIT_TIMEOUT_SECONDS", "300"))
 POLL_TIMEOUT = int(os.environ.get("RAG_MINERU_POLL_TIMEOUT_SECONDS", "10"))
 
 

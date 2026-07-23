@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import queue
+import shutil
 import signal
 import subprocess  # <-- added for zombie cleanup
 import sys
@@ -47,6 +48,14 @@ def _cleanup_stale_workers() -> None:
             subprocess.run(["kill", "-9"] + [str(p) for p in pids], timeout=5)
     except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError, ValueError):
         pass
+    # Also clean stale loky temp dirs that cause MinerU BrokenProcessPool
+    for p in Path("/tmp").glob("loky-*"):
+        try:
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+                log.info("Cleaned stale loky dir: %s", p.name)
+        except Exception:
+            pass
 
 
 _cleanup_stale_workers()
@@ -88,7 +97,7 @@ def _init_model() -> FlagModel:
         with _model_init_lock:
             if _model is None:
                 log.info("Loading BGE-M3 model...")
-                _model = FlagModel("BAAI/bge-m3", devices=["cpu"], use_fp16=False, num_processes=1)
+                _model = FlagModel("BAAI/bge-m3", devices=["cpu"], use_fp16=False, num_processes=1, batch_size=32)
                 log.info("BGE-M3 loaded OK")
     return _model
 
