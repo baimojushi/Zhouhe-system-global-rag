@@ -44,7 +44,8 @@ def _cleanup_stale_workers() -> None:
         )
         pids = [int(p) for p in out.decode().strip().splitlines() if p.strip()]
         if pids:
-            log.warning("Cleaning %d stale multiprocessing-spawn processes (RSS may exceed 4 GB)", len(pids))
+            # Can't use log.warning here — log not yet defined at module level
+            print(f"[cleanup] Cleaning {len(pids)} stale multiprocessing-spawn processes")
             subprocess.run(["kill", "-9"] + [str(p) for p in pids], timeout=5)
     except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError, ValueError):
         pass
@@ -53,7 +54,7 @@ def _cleanup_stale_workers() -> None:
         try:
             if p.is_dir():
                 shutil.rmtree(p, ignore_errors=True)
-                log.info("Cleaned stale loky dir: %s", p.name)
+                print(f"[cleanup] Removed stale loky dir: {p.name}")
         except Exception:
             pass
 
@@ -73,7 +74,7 @@ PORT = int(os.environ.get("RAG_EMBEDDING_PORT", "9102"))
 LOG_FILE = Path("/opt/global-rag/logs/embedding-service.log")
 CACHE_SIZE = int(os.environ.get("RAG_QUERY_VECTOR_CACHE_SIZE", "2048"))
 CACHE_TTL = float(os.environ.get("RAG_QUERY_VECTOR_CACHE_TTL_SECONDS", "900"))
-MAX_BATCH = int(os.environ.get("RAG_EMBEDDING_MAX_BATCH", "128"))
+MAX_BATCH = int(os.environ.get("RAG_EMBEDDING_MAX_BATCH", "512"))
 
 os.makedirs(LOG_FILE.parent, exist_ok=True)
 logging.basicConfig(
