@@ -462,7 +462,10 @@ def process_pdf_job(
         )
     except Exception as exc:
         log.warning("create_parse_job failed for %s: %s — cleaning stale parse_job and retrying", ingest_job_id, exc)
-        store._connect().execute("DELETE FROM parse_jobs WHERE ingest_job_id = ?", (ingest_job_id,))
+        # Must use the same connection/transaction that create_parse_job uses
+        conn = store._connect()
+        conn.execute("DELETE FROM parse_jobs WHERE ingest_job_id = ?", (ingest_job_id,))
+        conn.commit()
         parse_job = store.create_parse_job(
             ingest_job_id=ingest_job_id,
             document_id=document_id,
