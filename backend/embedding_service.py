@@ -98,7 +98,7 @@ def _init_model() -> FlagModel:
         with _model_init_lock:
             if _model is None:
                 log.info("Loading BGE-M3 model...")
-                _model = FlagModel("BAAI/bge-m3", devices=["cpu"], use_fp16=False, num_processes=1, batch_size=32)
+                _model = FlagModel("BAAI/bge-m3", devices=["cuda:0"], use_fp16=True, num_processes=1, batch_size=32)
                 log.info("BGE-M3 loaded OK")
     return _model
 
