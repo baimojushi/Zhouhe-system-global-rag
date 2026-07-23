@@ -13,7 +13,7 @@
     "start": "node scripts/start-local.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern .test-work",
     "typecheck": "tsc --noEmit --pretty false",
-    "test:backend": "python3 -m unittest backend/test_knowledge_store.py backend/test_query_rewriter.py backend/test_ingest_layout.py backend/test_ingest_service.py -v",
+    "test:backend": "python3 -m unittest backend/test_knowledge_store.py backend/test_query_rewriter.py backend/test_ingest_layout.py backend/test_ingest_service.py backend/test_post_parse_filename.py -v",
     "verify:ui": "node scripts/verify-ui.mjs"
   },
   "dependencies": {

@@ -6,6 +6,8 @@ Windows 原始资料目录固定为 `E:\RAG`，按四个文档知识库建立一
 
 2026-07-20：知识检索页新增显式开启的 LLM 多问法扩展、加权排名融合与自动降级；详见 [QUERY_REWRITE_IMPLEMENTATION_20260720.md](QUERY_REWRITE_IMPLEMENTATION_20260720.md)。
 
+2026-07-21：PDF 在 MinerU 解析完成后、向量入库之前，由本地 Gemma 基于结构化结果生成统一文件名，并安全同步 Windows 文件、SQLite 路径和检索展示；详见 [PDF_POST_PARSE_RENAME_IMPLEMENTATION_20260721.md](PDF_POST_PARSE_RENAME_IMPLEMENTATION_20260721.md)。
+
 完整安装、Docker、API 和 CORS 说明见 [README_LOCAL_DEPLOY.md](README_LOCAL_DEPLOY.md)。
 固定依赖版本见 [DEPENDENCY_MANIFEST.md](DEPENDENCY_MANIFEST.md)。
 本次 master/runtime 合并内容与验证结果见 [MERGE_REPORT_20260717.md](MERGE_REPORT_20260717.md)。

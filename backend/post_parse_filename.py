@@ -179,7 +179,7 @@ def request_gemma_filename(source_name: str, evidence: dict[str, Any]) -> tuple[
             {"role": "user", "content": json.dumps(user_data, ensure_ascii=False)},
         ],
         "temperature": 0.0,
-        "max_tokens": 500,
+        "max_tokens": int(os.environ.get("RAG_PDF_RENAME_MAX_TOKENS", "2000")),
         "response_format": {"type": "json_object"},
     }, ensure_ascii=False).encode("utf-8")
     headers = {"Content-Type": "application/json"}

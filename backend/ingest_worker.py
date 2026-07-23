@@ -451,14 +451,25 @@ def process_pdf_job(
                 store, indexed_job, indexed_job["source_path"], source_hash, cached,
             )
 
-    # Create parse_job record
-    parse_job = store.create_parse_job(
-        ingest_job_id=ingest_job_id,
-        document_id=document_id,
-        version_id=version_id,
-        source_hash=source_hash,
-        config_fingerprint=config_fingerprint,
-    )
+    # Create parse_job record — guard against stale leftovers from retry races
+    try:
+        parse_job = store.create_parse_job(
+            ingest_job_id=ingest_job_id,
+            document_id=document_id,
+            version_id=version_id,
+            source_hash=source_hash,
+            config_fingerprint=config_fingerprint,
+        )
+    except Exception as exc:
+        log.warning("create_parse_job failed for %s: %s — cleaning stale parse_job and retrying", ingest_job_id, exc)
+        store._connect().execute("DELETE FROM parse_jobs WHERE ingest_job_id = ?", (ingest_job_id,))
+        parse_job = store.create_parse_job(
+            ingest_job_id=ingest_job_id,
+            document_id=document_id,
+            version_id=version_id,
+            source_hash=source_hash,
+            config_fingerprint=config_fingerprint,
+        )
     log.info("Created parse_job %s for ingest %s", parse_job["id"], ingest_job_id)
 
     # Submit to MinerU

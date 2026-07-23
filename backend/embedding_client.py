@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 EMBEDDING_URL = os.environ.get("RAG_EMBEDDING_URL", "http://127.0.0.1:9102")
-CLIENT_TIMEOUT = float(os.environ.get("RAG_EMBEDDING_CLIENT_TIMEOUT", "30"))
+CLIENT_TIMEOUT = float(os.environ.get("RAG_EMBEDDING_CLIENT_TIMEOUT", "120"))
 CACHE_SIZE = int(os.environ.get("RAG_QUERY_VECTOR_CACHE_SIZE", "2048"))
 CACHE_TTL = float(os.environ.get("RAG_QUERY_VECTOR_CACHE_TTL_SECONDS", "900"))
 
@@ -115,9 +115,24 @@ def encode(texts: list[str], priority: str = "high") -> list[list[float]]:
         with urlopen(req, timeout=CLIENT_TIMEOUT) as resp:
             body = resp.read(10 * 1024 * 1024)
         result = json.loads(body.decode("utf-8"))
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+    except HTTPError as exc:
         with _metrics_lock:
             _metrics["client_errors"] += 1
+        resp_body = exc.read(5 * 1024) if exc.fp else b""
+        log.error(
+            "Embedding HTTP %d: %s  |  texts=%d  elapsed=%.1fs  body=%.200s",
+            exc.code, exc.reason, len(texts), time.monotonic() - t0, resp_body,
+        )
+        raise EmbeddingServiceError(
+            f"embedding service call failed: HTTP {exc.code} {exc.reason}"
+        ) from exc
+    except (URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        with _metrics_lock:
+            _metrics["client_errors"] += 1
+        log.error(
+            "Embedding %s: texts=%d elapsed=%.1fs  %s",
+            type(exc).__name__, len(texts), time.monotonic() - t0, exc,
+        )
         raise EmbeddingServiceError(f"embedding service call failed: {type(exc).__name__}") from exc
 
     vectors: list[list[float]] = result.get("vectors", [])

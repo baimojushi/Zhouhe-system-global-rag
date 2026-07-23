@@ -15,6 +15,8 @@ import json
 import logging
 import os
 import queue
+import signal
+import subprocess  # <-- added for zombie cleanup
 import sys
 import threading
 import time
@@ -25,6 +27,29 @@ from typing import Any
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("HF_HOME", "/opt/global-rag/cache/huggingface")
 os.environ.setdefault("DOCLING_ARTIFACTS_PATH", "/opt/global-rag/cache/docling-models")
+
+
+# ---------------------------------------------------------------------------
+# Startup cleanup: kill orphaned multiprocessing-spawn processes from
+# previous crashed FlagModel instances. Each crash leaves ~400 MB-1.4 GB
+# of RSS behind, accumulating until OOM kills the service silently.
+# ---------------------------------------------------------------------------
+def _cleanup_stale_workers() -> None:
+    """Kill leftover multiprocessing.spawn processes from prior runs."""
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-f", "multiprocessing.spawn"],
+            timeout=5, stderr=subprocess.DEVNULL,
+        )
+        pids = [int(p) for p in out.decode().strip().splitlines() if p.strip()]
+        if pids:
+            log.warning("Cleaning %d stale multiprocessing-spawn processes (RSS may exceed 4 GB)", len(pids))
+            subprocess.run(["kill", "-9"] + [str(p) for p in pids], timeout=5)
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        pass
+
+
+_cleanup_stale_workers()
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -63,7 +88,7 @@ def _init_model() -> FlagModel:
         with _model_init_lock:
             if _model is None:
                 log.info("Loading BGE-M3 model...")
-                _model = FlagModel("BAAI/bge-m3", cpu="CPU", use_fp16=False)
+                _model = FlagModel("BAAI/bge-m3", devices=["cpu"], use_fp16=False, num_processes=1)
                 log.info("BGE-M3 loaded OK")
     return _model
 
@@ -126,7 +151,7 @@ def _encode_worker() -> None:
     model = _init_model()
     while True:
         try:
-            priority, texts, result = _encode_queue.get(timeout=1.0)
+            priority, _seq, texts, result = _encode_queue.get(timeout=1.0)
         except queue.Empty:
             continue
 
@@ -159,11 +184,18 @@ for i in range(_NUM_WORKERS):
     log.info("Embedding worker %d started", i)
 
 
+_SEQ = 0
+_SEQ_LOCK = threading.Lock()
+
 async def _do_encode(texts: list[str], priority: str = "high") -> tuple[list[list[float]], float]:
     """Submit to priority queue and wait for result."""
     prio = 0 if priority == "high" else 1
+    with _SEQ_LOCK:
+        global _SEQ
+        _SEQ += 1
+        seq = _SEQ
     result: dict[str, Any] = {"done": threading.Event()}
-    _encode_queue.put((prio, texts, result))
+    _encode_queue.put((prio, seq, texts, result))
 
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, result["done"].wait)

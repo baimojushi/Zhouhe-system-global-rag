@@ -27,11 +27,13 @@ try:
         host="localhost", port=8080, grpc_port=50051,
         auth_credentials=weaviate.auth.AuthApiKey(api_key),
     )
-    meta = client.meta
-    print(f"  Weaviate connected: {meta.name} v{meta.version}")
-    collections = client.collections.list_all()
-    print(f"  Collections: {list(collections.keys())}")
+    # weaviate-client v4 uses client.is_ready() instead of client.meta
+    ready = client.is_ready()
+    print(f"  Weaviate connected, ready={ready}")
+    collections = list(client.collections.list_all().keys())
+    print(f"  Collections: {collections}")
     client.close()
+    print("  Connection closed cleanly")
 except Exception as e:
     print(f"  Weaviate ERROR: {e}")
     sys.exit(1)
