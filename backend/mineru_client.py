@@ -245,12 +245,21 @@ class MinerUClient:
     ) -> MinerUTaskStatus:
         """Poll task status until terminal or timeout. Returns final status."""
         deadline = time.time() + (max_seconds or self.max_parse_seconds)
+        queued_deadline = time.time() + 600  # max 10 min waiting in queue
         last_status: Optional[MinerUTaskStatus] = None
         while time.time() < deadline:
             status = self.get_task_status(task_id)
             last_status = status
             if status.is_terminal:
                 return status
+            # If still pending with tasks ahead for too long, give up
+            if status.status == "pending" and not status.started_at:
+                if time.time() > queued_deadline:
+                    raise MinerUTimeoutError(
+                        f"Task {task_id} has been queued for >10 min "
+                        f"(ahead={status.queued_ahead}). "
+                        f"Last status: {status.status}"
+                    )
             time.sleep(self.poll_interval)
 
         raise MinerUTimeoutError(
