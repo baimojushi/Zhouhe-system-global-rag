@@ -61,6 +61,57 @@ def _cleanup_stale_workers() -> None:
 
 _cleanup_stale_workers()
 
+# ---------------------------------------------------------------------------
+# PID lock + watchdog — prevent duplicate instances
+# ---------------------------------------------------------------------------
+PID_FILE = Path("/opt/global-rag/run/embedding-service.pid")
+_my_pid = os.getpid()
+if PID_FILE.exists():
+    old = PID_FILE.read_text().strip()
+    if old:
+        try:
+            old_pid = int(old)
+            if old_pid != _my_pid:
+                os.kill(old_pid, 0)
+                print(f"[pidlock] Killing stale PID {old_pid}...")
+                os.kill(old_pid, signal.SIGTERM)
+                import time as _t
+                _t.sleep(2)
+                try:
+                    os.kill(old_pid, 0)
+                    os.kill(old_pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        except (ValueError, ProcessLookupError, OSError):
+            pass
+PID_FILE.write_text(str(_my_pid))
+
+
+def _watchdog() -> None:
+    import time as _t
+    while True:
+        _t.sleep(90)
+        try:
+            out = subprocess.check_output(
+                ["pgrep", "-f", "[e]mbedding_service.py"],
+                timeout=10, stderr=subprocess.DEVNULL,
+            )
+            pids = [int(p) for p in out.decode().strip().splitlines() if p.strip()]
+            if len(pids) > 1 and _my_pid in pids:
+                pids.remove(_my_pid)
+                for dup in pids:
+                    print(f"[watchdog] Killing duplicate PID {dup}")
+                    try:
+                        os.kill(dup, signal.SIGKILL)
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+
+
+_thread_watchdog = threading.Thread(target=_watchdog, daemon=True, name="embed-watchdog")
+_thread_watchdog.start()
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 

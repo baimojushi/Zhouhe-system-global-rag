@@ -42,6 +42,13 @@ ARTIFACT_ROOT = Path(
 )
 PDF_MAX_BYTES = int(os.environ.get("RAG_PDF_MAX_BYTES", str(500 * 1024 * 1024)))
 PDF_ALLOW_PARTIAL = os.environ.get("RAG_PDF_ALLOW_PARTIAL", "false").lower() in ("1", "true", "yes")
+MINERU_BACKEND = os.environ.get("RAG_MINERU_BACKEND", "hybrid-engine")
+MINERU_EFFORT = os.environ.get("RAG_MINERU_EFFORT", "medium")
+MINERU_LARGE_FILE_BYTES = int(
+    os.environ.get("RAG_MINERU_LARGE_FILE_BYTES", str(50 * 1024 * 1024))
+)
+MINERU_LARGE_FILE_EFFORT = os.environ.get("RAG_MINERU_LARGE_FILE_EFFORT", "medium")
+MINERU_PARSE_METHOD = os.environ.get("RAG_MINERU_PARSE_METHOD", "auto")
 
 
 # ---------------------------------------------------------------------------
