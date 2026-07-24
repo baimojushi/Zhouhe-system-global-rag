@@ -147,8 +147,16 @@ def get_library_collection(library_id: str, collection_name: str):
                 weaviate.classes.config.Property(name="library_id", data_type=weaviate.classes.config.DataType.TEXT),
                 weaviate.classes.config.Property(name="version_id", data_type=weaviate.classes.config.DataType.TEXT),
                 weaviate.classes.config.Property(name="node_id", data_type=weaviate.classes.config.DataType.TEXT),
+                weaviate.classes.config.Property(name="summary", data_type=weaviate.classes.config.DataType.TEXT),
             ],
             vector_config=weaviate.classes.config.Configure.Vectorizer.none(),
+        )
+    # Schema migration: add summary to existing collections
+    existing_props = [p.name for p in coll.config.get().properties]
+    if "summary" not in existing_props:
+        log.info("Adding 'summary' property to existing collection '%s'", weaviate_name)
+        coll.config.add_property(
+            weaviate.classes.config.Property(name="summary", data_type=weaviate.classes.config.DataType.TEXT)
         )
     _collection_cache[weaviate_name] = coll
     return coll
@@ -594,6 +602,18 @@ def _index_from_artifact(
     vectors = encode(texts_to_embed, priority="low")
 
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Extract summary from MinerU output (first meaningful text block)
+    summary = ""
+    for c in chunks:
+        txt = c.get("content", "").strip()
+        if len(txt) > 100:
+            summary = txt[:500]
+            break
+    if not summary and md_content:
+        # Fallback: first 500 chars of markdown
+        summary = md_content.strip()[:500]
+
     batch = []
     for idx, (chunk, vec) in enumerate(zip(chunks, vectors)):
         chunk_id = f"{version_id or document_id or source_hash[:16]}-{idx}"
@@ -604,6 +624,7 @@ def _index_from_artifact(
                 "content": chunk["content"],
                 "title": source_name,
                 "heading": chunk.get("heading", ""),
+                "summary": summary,
                 "source_path": source_path,
                 "source_name": source_name,
                 "source_hash": source_hash[:16],

@@ -319,7 +319,7 @@ def rename_after_mineru(
         )
 
     try:
-        max_chars = max(2000, min(int(os.environ.get("RAG_PDF_RENAME_MAX_EXCERPT_CHARS", "16000")), 40000))
+        max_chars = max(1500, min(int(os.environ.get("RAG_PDF_RENAME_MAX_EXCERPT_CHARS", "3000")), 10000))
         evidence = read_mineru_evidence(artifact_dir, max_chars=max_chars)
         proposal, model = request_gemma_filename(source.name, evidence)
         proposed_name, confidence, reason = canonical_filename(proposal)
