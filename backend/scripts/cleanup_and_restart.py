@@ -147,30 +147,31 @@ def start_embedding(timeout: int = 120) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Step 5: Start worker
+# Step 5: Start worker (tmux session for WSL persistence)
 # ---------------------------------------------------------------------------
 def start_worker() -> bool:
-    log("  Starting worker...")
-    env = os.environ.copy()
-    env.update({
-        "RAG_INGEST_ROOTS": "/mnt/e/RAG",
-        "RAG_AUTO_SCAN_SECONDS": "300",
-        "RAG_FILE_STABILITY_SECONDS": "30",
-        "RAG_PDF_RENAME_MAX_TOKENS": "2500",
-        "RAG_EMBEDDING_CLIENT_TIMEOUT": "300",
-    })
-    proc = subprocess.Popen(
-        [VENV_PYTHON, "/opt/global-rag/ingest_worker.py"],
-        stdout=open(f"{LOG_DIR}/ingest_worker.log", "a"),
-        stderr=subprocess.STDOUT,
-        cwd="/opt/global-rag",
-        env=env,
+    log("  Starting worker in tmux session...")
+    subprocess.run(
+        ["tmux", "kill-session", "-t", "worker"],
+        timeout=5, capture_output=True,
     )
-    with open(f"{RUN_DIR}/ingest-worker.pid", "w") as f:
-        f.write(str(proc.pid))
-    time.sleep(2)
-    alive = proc.poll() is None
-    log(f"  Worker PID={proc.pid} {'alive' if alive else 'FAILED'}")
+    env = os.environ.copy()
+    env["RAG_INGEST_ROOTS"] = "/mnt/e/RAG"
+    proc = subprocess.Popen(
+        ["tmux", "new-session", "-d", "-s", "worker",
+         "/opt/global-rag/venv/bin/python3 /opt/global-rag/ingest_worker.py"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        cwd="/opt/global-rag", env=env,
+    )
+    proc.wait(timeout=5)
+    # Check if worker is alive
+    time.sleep(3)
+    check = subprocess.run(
+        ["tmux", "has-session", "-t", "worker"],
+        capture_output=True,
+    )
+    alive = check.returncode == 0
+    log(f"  tmux worker session: {'alive' if alive else 'MISSING'}")
     return alive
 
 

@@ -51,15 +51,13 @@ for i in $(seq 1 30); do
 done
 
 # Also restart worker so it resubmits
-echo "  Restarting worker to resubmit tasks..."
+echo "  Restarting worker in tmux..."
 pkill -TERM -f '[i]ngest_worker.py' 2>/dev/null || true
-sleep 2
-
+sleep 1
+tmux kill-session -t worker 2>/dev/null
 cd /opt/global-rag
-nohup env RAG_INGEST_ROOTS=/mnt/e/RAG RAG_AUTO_SCAN_SECONDS=300 RAG_FILE_STABILITY_SECONDS=30 \
-  RAG_PDF_RENAME_MAX_TOKENS=2500 \
-  venv/bin/python3 ingest_worker.py >> logs/ingest_worker.log 2>&1 &
-echo "  Worker PID=$!"
+RAG_INGEST_ROOTS=/mnt/e/RAG tmux new-session -d -s worker "venv/bin/python3 ingest_worker.py"
+echo "  Worker started in tmux session 'worker'"
 
 echo ""
 echo "=== Done ==="
